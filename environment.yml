@@ -1,0 +1,26 @@
+# PixelForge Studio 环境（RTX 50 系 Blackwell 需 CUDA 12.8+）
+# 创建：conda env create -f environment.yml
+# 激活：conda activate pixelforge
+name: pixelforge
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  # 如为 RTX 50 系显卡，建议改用 pytorch-cuda=12.8 并确认 PyTorch 为 cu128 构建
+  - pytorch-cuda=12.8
+  - numpy
+  - pillow
+  - opencv
+  - requests
+  - websocket-client
+  - pip
+  - pip:
+      - PySide6
+      # rembg 为阶段2 去背景兜底方案，按需启用
+      # - rembg

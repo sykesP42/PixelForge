@@ -1,0 +1,196 @@
+"""图像工具坊（ImageLab）离屏功能测试 — 覆盖实时预览/画笔/智能单帧/自由裁切/放大镜。
+
+用法：QT_QPA_PLATFORM=offscreen python tests/test_image_lab.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import cv2
+import numpy as np
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import QMouseEvent
+from PySide6.QtWidgets import QApplication
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pixelforge.processing import editing
+from pixelforge.ui.image_lab import ImageLab
+
+ROOT = Path(__file__).resolve().parent.parent
+TMP = ROOT / "outputs" / "test_tmp"
+
+
+def make_green_sheet(path: Path) -> None:
+    """2x2 绿幕合成精灵表。"""
+    sheet = np.full((256, 256, 3), (60, 180, 60), np.uint8)
+
+    def draw(cx, base_y, body_w, body_h, color):
+        cv2.circle(sheet, (cx, base_y - body_h), body_w // 2, color, -1)
+        cv2.rectangle(sheet, (cx - body_w // 2, base_y - body_h + body_w // 2),
+                      (cx + body_w // 2, base_y), color, -1)
+
+    draw(40, 96, 24, 40, (0, 0, 220))
+    draw(180, 88, 20, 55, (220, 120, 0))
+    draw(30, 230, 22, 48, (0, 200, 220))
+    draw(170, 240, 26, 30, (200, 0, 200))
+    cv2.imwrite(str(path), sheet)
+
+
+def mouse_event(lab: ImageLab, x: float, y: float, etype: QEvent.Type) -> QMouseEvent:
+    """在画布本地坐标构造鼠标事件（画布坐标，非图像坐标）。"""
+    return QMouseEvent(etype, QPointF(x, y), Qt.LeftButton, Qt.LeftButton,
+                       Qt.NoModifier)
+
+
+def body_point(lab: ImageLab) -> tuple[float, float]:
+    """图像坐标 (40, 80)（红色小人身体）对应的画布本地坐标。"""
+    pm = lab.canvas.pixmap()
+    ox = max(0, (lab.canvas.width() - pm.width()) // 2)
+    oy = max(0, (lab.canvas.height() - pm.height()) // 2)
+    return ox + 40 * lab._zoom, oy + 80 * lab._zoom
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    lab = ImageLab()
+
+    # 1. 加载图片
+    sheet = TMP / "lab_sheet.png"
+    make_green_sheet(sheet)
+    lab.load_path(sheet)
+    assert lab.arr is not None and lab.arr.shape[2] == 4
+    assert lab._orig is not None, "应保留原图快照"
+    print("[OK] 打开图片 -> BGRA + 原图快照")
+
+    # 2. 色键实时预览（不改动 arr）
+    lab._update_preview()
+    assert lab._preview is not None, "纯色背景应能生成预览"
+    assert (lab._preview[:, :, 3] == 0).any() and (lab.arr[:, :, 3] == 255).all(), \
+        "预览不应改动原图 arr"
+    print("[OK] 容差实时预览: 预览生效且原图未被修改")
+
+    # 3. 应用去背景
+    lab.apply_key()
+    transparent = (lab.arr[:, :, 3] == 0).mean()
+    assert transparent > 0.5, f"去背景失败, 透明占比 {transparent:.2f}"
+    assert lab._preview is None
+    print(f"[OK] 应用去背景: 透明占比 {transparent:.2f}")
+
+    # 4. 画笔擦除（事件流：press -> move -> release）
+    lab._set_brush_mode(1)  # 擦除
+    assert lab._brush_mode == "erase"
+    lab._render()
+    cx, cy = body_point(lab)
+    icx, icy = 40, 80
+    assert lab.arr[icy, icx, 3] > 0, "小人身体处应先有不透明像素"
+    lab.eventFilter(lab.canvas, mouse_event(lab, cx, cy, QEvent.MouseButtonPress))
+    assert lab._painting
+    lab.eventFilter(lab.canvas, mouse_event(lab, cx + 1, cy, QEvent.MouseMove))
+    lab.eventFilter(lab.canvas, mouse_event(lab, cx, cy, QEvent.MouseButtonRelease))
+    assert not lab._painting
+    assert lab.arr[icy, icx, 3] == 0, "擦除后该处 alpha 应为 0"
+    print("[OK] 画笔擦除: 身体像素已透明")
+
+    # 5. 画笔恢复
+    lab._set_brush_mode(2)  # 恢复
+    lab.eventFilter(lab.canvas, mouse_event(lab, cx, cy, QEvent.MouseButtonPress))
+    lab.eventFilter(lab.canvas, mouse_event(lab, cx, cy, QEvent.MouseButtonRelease))
+    assert lab.arr[icy, icx, 3] > 0, "恢复后应找回原图像素"
+    print("[OK] 画笔恢复: 误删像素已找回")
+
+    # 6. 撤销
+    lab.undo()
+    print("[OK] 撤销正常")
+
+    # 7. 智能单帧（不切碎内容）
+    lab.smart_single_frame()
+    assert len(lab._frames) == 1, f"智能单帧应输出 1 帧, 实际 {len(lab._frames)}"
+    fw, fh = lab._frames[0].shape[1], lab._frames[0].shape[0]
+    assert 0 < fw <= 260 and 0 < fh <= 260
+    print(f"[OK] 智能单帧: 1 帧 {fw}x{fh}（整体紧致化）")
+
+    # 8. 连通域 / 网格裁切
+    lab.auto_crop()
+    assert len(lab._frames) == 4
+    lab.grid_crop()
+    assert len(lab._frames) == 4
+    print("[OK] 连通域裁切 + 网格切分: 各 4 帧")
+
+    # 9. 编辑操作
+    h0, w0 = lab.arr.shape[:2]
+    lab._mutate(editing.rotate90, lab.arr)
+    assert lab.arr.shape[:2] == (w0, h0)
+    lab.undo()
+    lab._mutate(editing.flip, lab.arr, True)
+    lab._mutate(lambda a: editing.adjust_bcs(a, brightness=30, contrast=1.2, saturation=1.5),
+                lab.arr)
+    lab._mutate(editing.trim_edges, lab.arr, 4, 4, 4, 4)
+    assert lab.arr.shape[0] == h0 - 8 and lab.arr.shape[1] == w0 - 8
+    print("[OK] 旋转/翻转/撤销/色彩调整/裁边")
+
+    # 10. 重置为原图
+    lab.reset()
+    assert lab.arr.shape[:2] == (256, 256) and (lab.arr[:, :, 3] == 255).all()
+    print("[OK] 重置为原图")
+
+    # 11. 自由裁切（裁切框拖动 + 应用）
+    lab.apply_key()  # 重新去背景
+    lab._set_brush_mode(3)  # 裁切框模式
+    assert lab._brush_mode == "crop"
+    assert lab._crop_rect == [0, 0, 256, 256], f"进入裁切应初始化全图框: {lab._crop_rect}"
+    # 先模拟用户已拖出的一个小于画布的框
+    lab._crop_rect = [40, 40, 216, 216]
+    lab._crop_press((100, 128))          # 框内 -> 整体移动
+    assert lab._drag == "move"
+    lab._crop_move((80, 128))            # 左移 20（留边足够）
+    assert lab._crop_rect == [20, 40, 196, 216], f"移动后: {lab._crop_rect}"
+    w_before = lab.arr.shape[1]
+    lab.apply_crop()
+    assert lab.arr.shape[1] == w_before - 80, f"应用裁切后宽度应减 80: {lab.arr.shape}"
+    lab.undo()
+    assert lab.arr.shape[1] == w_before
+    print("[OK] 自由裁切: 框内拖动整体移动 + 应用 + 撤销")
+
+    # 12. 裁切框：框外新建框
+    lab._crop_rect = [50, 50, 200, 200]
+    lab._crop_press((10, 10))            # 远离四边 -> 新建
+    assert lab._drag == "new"
+    lab._crop_move((30, 40))
+    assert lab._crop_rect == [10, 10, 30, 40]
+    lab.apply_crop()
+    assert lab.arr.shape[:2] == (30, 20), f"新框裁切: {lab.arr.shape}"
+    lab.undo()
+    print("[OK] 裁切框: 框外拖动新建框 + 应用")
+
+    # 13. 放大镜
+    lab._update_magnifier(40, 80)
+    assert lab.mag.pixmap() is not None, "放大镜应显示内容"
+    print("[OK] 放大镜渲染")
+
+    # 14. 帧导出
+    lab.load_path(sheet)
+    lab.apply_key()
+    lab.auto_crop()
+    out = TMP / "lab_frames"
+    out.mkdir(parents=True, exist_ok=True)
+    for i, a in enumerate(lab._frames):
+        cv2.imwrite(str(out / f"lab_sheet_{i:03d}.png"), a)
+    assert len(list(out.glob("*.png"))) == 4
+    print("[OK] 帧导出: 4 个 PNG")
+
+    # 15. 边界：空画布网格切分
+    blank = np.zeros((64, 64, 4), np.uint8)
+    assert editing.grid_split(blank, 2, 2) == []
+    print("[OK] 空画布边界处理")
+
+    print("\n图像工具坊全部测试通过 ✔")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

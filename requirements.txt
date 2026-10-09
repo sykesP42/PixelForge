@@ -1,0 +1,13 @@
+# PixelForge Studio 依赖清单
+# 用法：在目标 Conda 环境中执行  pip install -r requirements.txt
+# 注意：PyTorch / CUDA 由 Conda 侧管理（见 environment.yml），此处不重复安装
+
+PySide6>=6.6
+websocket-client>=1.7
+numpy>=1.24
+pillow>=10.0
+opencv-python>=4.8
+requests>=2.31
+
+# 可选：背景移除兜底（阶段2 启用，体积较大，按需安装）
+# rembg[gpu]

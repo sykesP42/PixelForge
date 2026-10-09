@@ -1,0 +1,14 @@
+{
+  "1": {"class_type": "UnetLoaderGGUF", "inputs": {"unet_name": "wan2.1-i2v-14b-480p-Q4_K_M.gguf"}},
+  "2": {"class_type": "CLIPLoaderGGUF", "inputs": {"clip_name": "umt5-xxl-encoder-Q4_K_M.gguf", "type": "wan"}},
+  "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+  "4": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+  "5": {"class_type": "LoadImage", "inputs": {"image": "__IMAGE__"}},
+  "6": {"class_type": "CLIPVisionEncode", "inputs": {"crop": "center", "clip_vision": ["4", 0], "image": ["5", 0]}},
+  "7": {"class_type": "CLIPTextEncode", "inputs": {"text": "__PROMPT__", "clip": ["2", 0]}},
+  "8": {"class_type": "CLIPTextEncode", "inputs": {"text": "__NEGATIVE__", "clip": ["2", 0]}},
+  "9": {"class_type": "WanImageToVideo", "inputs": {"positive": ["7", 0], "negative": ["8", 0], "vae": ["3", 0], "clip_vision_output": ["6", 0], "start_image": ["5", 0], "width": 832, "height": 480, "length": 49, "batch_size": 1}},
+  "10": {"class_type": "KSampler", "inputs": {"seed": "__SEED__", "steps": "__STEPS__", "cfg": "__CFG__", "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0, "model": ["1", 0], "positive": ["9", 0], "negative": ["9", 1], "latent_image": ["9", 2]}},
+  "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
+  "12": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["11", 0], "frame_rate": 24, "loop_count": 0, "filename_prefix": "PixelForgeWan", "format": "video/h264-mp4", "pingpong": false, "save_output": true}}
+}

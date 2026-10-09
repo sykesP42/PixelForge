@@ -1,0 +1,13 @@
+{
+  "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_2.1_int8_convrot.safetensors", "weight_dtype": "default"}},
+  "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_int8_convrot.safetensors", "type": "qwen_image", "device": "default"}},
+  "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
+  "4": {"class_type": "QwenImage21Cache", "inputs": {"model": ["1", 0], "device": "auto", "dtype": "default"}},
+  "6": {"class_type": "LoadImage", "inputs": {"image": "__IMAGE__"}},
+  "7": {"class_type": "LoadImage", "inputs": {"image": "__PREV__"}},
+  "8": {"class_type": "LoadImage", "inputs": {"image": "__NEXT__"}},
+  "5": {"class_type": "TextEncodeQwenImage21", "inputs": {"prompt": "__PROMPT__", "negative_prompt": "__NEGATIVE__", "resolution": 0, "clip": ["2", 0], "images.image_1": ["6", 0], "images.image_2": ["7", 0], "images.image_3": ["8", 0], "vae": ["3", 0]}},
+  "11": {"class_type": "KSampler", "inputs": {"seed": "__SEED__", "steps": "__STEPS__", "cfg": "__CFG__", "sampler_name": "euler", "scheduler": "simple", "denoise": "__DENOISE__", "model": ["4", 0], "positive": ["5", 0], "negative": ["5", 1], "latent_image": ["5", 2]}},
+  "9": {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}},
+  "10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "PixelForgeRerollCtx", "images": ["9", 0]}}
+}

@@ -1,0 +1,11 @@
+{
+  "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "__CHECKPOINT__"}},
+  "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "__PROMPT__", "clip": ["1", 1]}},
+  "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "__NEGATIVE__", "clip": ["1", 1]}},
+  "4": {"class_type": "LoadImage", "inputs": {"image": "__IMAGE__"}},
+  "5": {"class_type": "VAEEncode", "inputs": {"pixels": ["4", 0], "vae": ["1", 2]}},
+  "6": {"class_type": "SetLatentNoiseMask", "inputs": {"samples": ["5", 0], "mask": ["4", 1]}},
+  "7": {"class_type": "KSampler", "inputs": {"seed": "__SEED__", "steps": "__STEPS__", "cfg": "__CFG__", "sampler_name": "euler", "scheduler": "normal", "denoise": "__DENOISE__", "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["6", 0]}},
+  "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["1", 2]}},
+  "9": {"class_type": "SaveImage", "inputs": {"filename_prefix": "PixelForgeRedraw", "images": ["8", 0]}}
+}
