@@ -713,6 +713,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"PixelForge Studio v{__version__}")
         self.resize(1360, 860)
         self.setMinimumSize(1120, 720)
+        self.setAcceptDrops(True)        # 拖入图片/JSON/帧目录即可打开
         self.pool = QThreadPool.globalInstance()
         self.conda_exe = ""
         self.settings = Settings.load()
@@ -855,6 +856,11 @@ class MainWindow(QMainWindow):
             ("右键", "载入 / 重跑 / 导入提示词 / 预览 / 删除"),
             ("悬停", "浮窗预览参考图 + 产物 + 提示词"),
         ]),
+        ("拖拽打开（拖到窗口任意空白处）", [
+            ("拖入 Aseprite JSON", "载入为多动画组并跳到动画播放"),
+            ("拖入图片", "1 张 → 看图器预览；多张 → 作为动画帧播放"),
+            ("拖入文件夹", "把其中的 PNG 序列载入动画播放"),
+        ]),
     ]
 
     def _install_shortcuts(self) -> None:
@@ -910,6 +916,79 @@ class MainWindow(QMainWindow):
         row.addWidget(b)
         lay.addLayout(row)
         dlg.exec()
+
+    # ---- 拖拽打开（把文件/文件夹拖到窗口任意空白处） ----
+
+    DROP_IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tga")
+
+    def dragEnterEvent(self, e) -> None:
+        md = e.mimeData()
+        if md.hasUrls() and any(u.isLocalFile() for u in md.urls()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e) -> None:
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+
+    def dropEvent(self, e) -> None:
+        paths = [Path(u.toLocalFile()) for u in e.mimeData().urls()
+                 if u.isLocalFile()]
+        paths = [p for p in paths if p.exists()]
+        if not paths:
+            e.ignore()
+            return
+        e.acceptProposedAction()
+        self._handle_dropped(paths)
+
+    def _handle_dropped(self, paths: list[Path]) -> None:
+        """按类型分流：Aseprite JSON→播放器多动画；目录→帧目录；
+        单图→看图器；多图→动画帧。"""
+        from pixelforge.processing.aseprite_io import frames_by_tag
+        jsons = [p for p in paths
+                 if p.is_file() and p.suffix.lower() == ".json"]
+        imgs = [p for p in paths if p.is_file()
+                and p.suffix.lower() in self.DROP_IMG_EXTS]
+        dirs = [p for p in paths if p.is_dir()]
+        done: list[str] = []
+        for j in jsons:
+            try:
+                clips = frames_by_tag(str(j))
+            except Exception as ex:  # noqa: BLE001 非动画 JSON 直接忽略
+                self.log(f"⚠ 拖入的 JSON 不是可解析的 Aseprite 动画（{j.name}）：{ex}")
+                continue
+            if not clips:
+                continue
+            self.anim_player._clips = {
+                n: self.anim_player._normalize(list(a))
+                for n, a in clips.items()}
+            first = next(iter(self.anim_player._clips))
+            self.anim_player.set_frames(
+                self.anim_player._clips[first], name=first, keep_clips=True)
+            self.tabs.setCurrentWidget(self.anim_player)
+            done.append(f"{j.name}（{len(clips)} 个动画组）")
+        for d in dirs:
+            if self.anim_player.load_folder(d) == 0:
+                self.log(f"⚠ 目录 {d.name} 中没有 PNG 帧，已忽略")
+                continue
+            self.tabs.setCurrentWidget(self.anim_player)
+            done.append(f"{d.name}/（{len(self.anim_player._frames)} 帧）")
+        if imgs:
+            if len(imgs) == 1:
+                self.viewer.set_image(str(imgs[0]))
+                self.tabs.setCurrentIndex(0)
+                done.append(imgs[0].name)
+            else:
+                files = sorted(imgs)
+                self.anim_player.set_frames(list(files),
+                                            name=files[0].stem or "dropped")
+                self.tabs.setCurrentWidget(self.anim_player)
+                done.append(f"{len(files)} 张图片 → 动画帧")
+        if done:
+            self.log("📥 已打开拖入内容：" + "；".join(done))
+        else:
+            self.log("⚠ 拖入内容中没有可打开的图片 / Aseprite JSON / 帧目录")
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
