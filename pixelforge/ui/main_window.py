@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1112,6 +1114,11 @@ class MainWindow(QMainWindow):
         self.cmb_ui_mode.setToolTip(
             "笨蛋=选图选动作就生成 / 专注=核心参数 / 专业=全部设置")
         cl.addWidget(self.cmb_ui_mode)
+        self.btn_open_out = QPushButton("📂 输出目录")
+        self.btn_open_out.setToolTip("在文件管理器中打开产物输出目录（所有生成/导出默认落盘位置）")
+        self.btn_open_out.setFixedHeight(26)
+        self.btn_open_out.clicked.connect(self._open_output_dir)
+        cl.addWidget(self.btn_open_out)
         self.btn_settings_top = QPushButton("⚙ 设置")
         self.btn_settings_top.setToolTip("引擎 / API 密钥 / 高级生成 / 通用")
         self.btn_settings_top.setFixedHeight(26)
@@ -1410,6 +1417,31 @@ class MainWindow(QMainWindow):
         save_prompt_templates(templates)
         self._refresh_tpl_list(select=final)
         self.log(f"提示词模板已导入: {final}")
+
+    def _open_output_dir(self) -> None:
+        """在系统文件管理器中打开产物输出目录。"""
+        try:
+            out = Path(self.settings.output_path())
+        except Exception:  # noqa: BLE001
+            out = Path(PROJECT_ROOT) / "outputs"
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.log(f"❌ 无法创建输出目录 {out}: {e}")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(out))
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", str(out)])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", str(out)])
+        except OSError as e:
+            self.log(f"❌ 打开输出目录失败: {e}")
+            return
+        self.log(f"📂 已打开输出目录: {out}")
 
     def _open_settings_dialog(self) -> None:
         """设置对话框（三标签）。缓存实例：关闭=隐藏，控件与填写内容保留。"""
@@ -2218,7 +2250,6 @@ class MainWindow(QMainWindow):
             it = self.lst_gallery_wall.item(0)   # 无选中 → 打开最新一张
         if it is None:
             return
-        import os
         os.startfile(it.data(Qt.UserRole))
 
     def _gallery_menu(self, pos) -> None:

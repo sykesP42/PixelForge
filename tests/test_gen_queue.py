@@ -168,6 +168,20 @@ def main() -> int:
         assert all(not win.lst_queue.item(i).isHidden() for i in range(n))
         assert "2 / 共 2" in win.lbl_qcount.text(), win.lbl_qcount.text()
         print("[OK] 7. 队列筛选：状态过滤 + 关键词模糊 + 计数标签")
+
+        # ---------- 8. 打开输出目录（打桩 os.startfile） ----------
+        from pixelforge.ui import main_window as mw
+        target = tmp / "outdir_probe"
+        win.settings.output_dir = str(target)
+        calls = []
+        orig_startfile = getattr(mw.os, "startfile", None)
+        mw.os.startfile = lambda p: calls.append(p)
+        win._open_output_dir()
+        assert calls and Path(calls[0]) == target, f"应打开 {target}: {calls}"
+        assert target.is_dir(), "输出目录应被自动创建"
+        if orig_startfile is not None:
+            mw.os.startfile = orig_startfile
+        print("[OK] 8. 打开输出目录：自动创建目录并调起系统文件管理器")
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q
