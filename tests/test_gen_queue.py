@@ -199,6 +199,46 @@ def main() -> int:
         assert win.assets_panel._load_index()["categories"][
             win.assets_panel._rel(ref0)] == "local", "应登记为本地资产"
         print("[OK] 9. 上传素材收编：拖入外部图 → 本地资产 uploads/ + 参考图指向副本")
+
+        # ---------- 10. 生成前参数摘要确认 ----------
+        from PySide6.QtWidgets import QCheckBox, QDialog
+        s = win._collect_settings()
+        rows_g = win._gen_summary_rows(s, "gpt", refs=2, actions=3)
+        keys_g = dict(rows_g)
+        assert keys_g["引擎"] == "云端 GPT-Image" and keys_g["参考图"] == "2 张" \
+            and keys_g["动作数"] == "3" and "画质" in keys_g and "线路" in keys_g, \
+            f"GPT 摘要行缺失: {keys_g}"
+        rows_l = win._gen_summary_rows(s, "local", refs=1, actions=8)
+        keys_l = dict(rows_l)
+        assert keys_l["引擎"] == "本地 ComfyUI" and "Checkpoint" in keys_l \
+            and "种子" in keys_l and keys_l["动作数"] == "8", \
+            f"本地摘要行缺失: {keys_l}"
+        # 跳过标志 → 不弹窗直接放行
+        win._skip_gen_confirm = True
+        assert win._confirm_generate_summary(s, "gpt") is True
+        # 弹窗：取消 → False；确认+勾选 → True 且之后永久跳过
+        win._skip_gen_confirm = False
+        results = {"n": 0}
+        orig_exec = QDialog.exec
+        def _exec_reject(self):
+            results["n"] += 1
+            return 0
+        QDialog.exec = _exec_reject
+        try:
+            assert win._confirm_generate_summary(s, "gpt") is False
+            def _exec_accept(self):
+                results["n"] += 1
+                self.findChildren(QCheckBox)[0].setChecked(True)
+                return 1
+            QDialog.exec = _exec_accept
+            assert win._confirm_generate_summary(s, "gpt") is True
+            assert results["n"] == 2, f"应弹窗 2 次: {results['n']}"
+            assert win._confirm_generate_summary(s, "local") is True
+            assert results["n"] == 2, "勾选不再提示后不应再弹窗"
+        finally:
+            QDialog.exec = orig_exec
+            win._skip_gen_confirm = False
+        print("[OK] 10. 生成前参数摘要确认：GPT/本地行齐全 + 取消拦截 + 不再提示生效")
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q

@@ -725,6 +725,7 @@ class MainWindow(QMainWindow):
         self._qid_of_tn: dict = {}    # task_no -> 持久化队列记录 id
         self._qo_syncing = False      # 画质/线路控件双向同步防循环
         self._connected_once = False  # 首次连接成功时自动拉取模型列表
+        self._skip_gen_confirm = False  # 生成前摘要确认「本次会话不再提示」
 
         self._build_ui()
         self._wire_quality_oversea()
@@ -3402,6 +3403,83 @@ class MainWindow(QMainWindow):
             meta = "双击=载入该任务设置｜右键=复用/删除"
         self._show_hover_card(refs, results, text, QCursor.pos(), meta=meta)
 
+    # ---- 生成前参数摘要确认 ----
+
+    def _gpt_action_count(self) -> int:
+        """云端动作行数（空则按默认 3 个动作计）。"""
+        txt = (self.ed_actions.toPlainText()
+               if hasattr(self.ed_actions, "toPlainText")
+               else self.ed_actions.text())
+        n = sum(1 for l in txt.splitlines() if l.strip())
+        return n if n else 3
+
+    def _gen_summary_rows(self, s, engine: str, refs: int, actions: int):
+        """生成参数摘要行（纯数据，便于测试与复用）。"""
+        if engine == "gpt":
+            quality = {"low": "low（快速）", "high": "high（精细）"}.get(
+                s.gpt_quality, "medium（标准）")
+            return [
+                ("引擎", "云端 GPT-Image"),
+                ("模式", "笨蛋模式" if self.cmb_ui_mode.currentIndex() == 0
+                 else "专业模式"),
+                ("模型", s.gpt_model or "-"),
+                ("尺寸", s.gpt_size or "-"),
+                ("画质", quality),
+                ("线路", "海外" if s.gpt_oversea else "国内"),
+                ("背景", {"transparent": "透明", "opaque": "不透明"}.get(
+                    s.gpt_background, "自动")),
+                ("动作数", str(actions)),
+                ("参考图", f"{refs} 张"),
+            ]
+        rows = [
+            ("引擎", "本地 ComfyUI"),
+            ("Checkpoint", s.checkpoint or "-"),
+            ("尺寸", f"{s.width}x{s.height}"),
+            ("步数 / CFG", f"{s.steps} / {s.cfg}"),
+            ("种子", f"{s.seed}" + ("（锁定）" if s.lock_seed else "（随机）")),
+            ("动作数", str(actions)),
+            ("参考图", f"{refs} 张"),
+        ]
+        if s.pose_on and s.pose_paths:
+            rows.append(("骨架驱动", f"开（{len(s.pose_paths)} 图）"))
+        if s.i2i_frames >= 2:
+            rows.append(("跨帧一致性", f"开（{s.i2i_frames} 帧）"))
+        return rows
+
+    def _confirm_generate_summary(self, s, engine: str, refs: int = 0,
+                                  actions: int = 1) -> bool:
+        """生成前只读摘要确认；返回是否继续提交。勾选「不再提示」后本会话跳过。"""
+        if getattr(self, "_skip_gen_confirm", False):
+            return True
+        from PySide6.QtWidgets import QDialogButtonBox, QGridLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("生成前确认 — PixelForge")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("<b>请确认本次生成参数：</b>"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        for r, (k, v) in enumerate(self._gen_summary_rows(
+                s, engine, refs, actions)):
+            kl = QLabel(k)
+            kl.setStyleSheet("color:#8a8f98;")
+            vl = QLabel(str(v))
+            vl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(kl, r, 0)
+            grid.addWidget(vl, r, 1)
+        lay.addLayout(grid)
+        chk = QCheckBox("本次会话不再提示")
+        lay.addWidget(chk)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.button(QDialogButtonBox.Ok).setText("确认提交")
+        bb.button(QDialogButtonBox.Cancel).setText("取消")
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        accepted = dlg.exec() == QDialog.Accepted
+        if accepted and chk.isChecked():
+            self._skip_gen_confirm = True
+        return accepted
+
     def on_generate(self) -> None:
         s = self._collect_settings()
         basic = self.cmb_ui_mode.currentIndex() == 0
@@ -3422,6 +3500,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "PixelForge",
                                     "请先填写提示词（描述想要的动画）")
                 return
+            if not self._confirm_generate_summary(
+                    s, "gpt", refs=len(self._basic_ref_paths), actions=1):
+                self.log("已取消本次生成（参数摘要未确认）")
+                return
             self._save_gen_snapshot(s)
             self._start_gpt_generate(s, basic=True)
             return
@@ -3432,6 +3514,11 @@ class MainWindow(QMainWindow):
             if not s.gpt_api_key:
                 QMessageBox.warning(self, "PixelForge",
                                     "请先在高级设置 → 云端引擎 GPT-Image 填写 API Key")
+                return
+            if not self._confirm_generate_summary(
+                    s, "gpt", refs=1 if s.ref_image else 0,
+                    actions=self._gpt_action_count()):
+                self.log("已取消本次生成（参数摘要未确认）")
                 return
             self._start_gpt_generate(s)
             return
@@ -3457,6 +3544,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "PixelForge", f"工作流模板解析失败: {e}")
             return
 
+        if not self._confirm_generate_summary(
+                s, "local", refs=1 if s.ref_image else 0,
+                actions=len(self._action_list())):
+            self.log("已取消本次生成（参数摘要未确认）")
+            return
         s.save()
         self._save_gen_snapshot(s)   # 自动记录本次生成的全部设置（可回载）
         self._busy = True
