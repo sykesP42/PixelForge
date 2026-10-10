@@ -7,7 +7,7 @@
 - A/B 对比：弹出对比窗口，左=原图(A) 右=当前(B)，黄色分割线可拖动比对
 - 智能单帧：整体内容紧致化输出 1 帧（单角色图不再被网格切碎）
 - 自动裁切双模式：连通域 / 网格切分（行 x 列）
-- 逐帧位移/缩放：裁切后逐帧调位移与缩放（锚点：中心/脚底/左上），一键应用到全部帧、一键脚底对齐
+- 逐帧位移/缩放对话框（FrameAdjustDialog）：入口在动画播放器（裁切后逐帧调位移与缩放，锚点中心/脚底/左上，一键应用/脚底对齐）
 - 自由裁切：画布叠加裁切框，拖四边微调 / 框内整体移动 / 框外拖动新建框
 - 放大镜：鼠标位置实时放大预览（可开关），配合裁切线/画笔精确操作
 - 常用编辑：亮度/对比度/饱和度（带数值显示）、旋转90°、水平/垂直翻转、手动裁边
@@ -831,32 +831,12 @@ class ImageLab(QWidget):
         bp = QPushButton("发送到动画播放器")
         bp.clicked.connect(self.send_to_player)
         vb.addWidget(bp)
-        ba = QPushButton("⇕ 逐帧位移/缩放...")
-        ba.setToolTip("裁切后逐帧调位移与缩放：一键应用/一键脚底对齐，消掉帧间抖动")
-        ba.clicked.connect(self._open_frame_adjust)
-        vb.addWidget(ba)
         bf = QPushButton("保存全部帧...")
         bf.clicked.connect(self.save_frames)
         vb.addWidget(bf)
         vb.addStretch(1)
         h.addLayout(vb)
         return w
-
-    def _open_frame_adjust(self) -> None:
-        """逐帧位移/缩放调节对话框（裁切后对齐用）。"""
-        if not self._frames:
-            self.status("请先裁切出帧，再调节每帧位移/缩放")
-            return
-        dlg = FrameAdjustDialog(self._frames, self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        frames = dlg.result_frames()
-        if not frames:
-            return
-        self._push_undo_frames()
-        self._set_frames(frames)
-        h, w = frames[0].shape[:2]
-        self.status(f"已应用逐帧位移/缩放：{len(frames)} 帧 → 统一画布 {w}x{h}")
 
     # ---------------- 文件 ----------------
 
@@ -961,13 +941,6 @@ class ImageLab(QWidget):
         """记录当前画布快照（撤销用）。"""
         if self.arr is not None:
             self._undo.append(("arr", self.arr.copy()))
-            if len(self._undo) > 20:
-                self._undo.pop(0)
-
-    def _push_undo_frames(self) -> None:
-        """记录当前帧列表快照（逐帧位移/缩放等帧级操作撤销用）。"""
-        if self._frames:
-            self._undo.append(("frames", [f.copy() for f in self._frames]))
             if len(self._undo) > 20:
                 self._undo.pop(0)
 

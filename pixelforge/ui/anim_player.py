@@ -143,6 +143,12 @@ class AnimPlayer(QWidget):
         btn_load = QPushButton("打开会话...")
         btn_load.clicked.connect(self.load_session_dialog)
         bar2.addWidget(btn_load)
+        self.btn_adjust = QPushButton("⇕ 逐帧位移/缩放...")
+        self.btn_adjust.setToolTip(
+            "逐帧调节位移与缩放（锚点：中心/脚底中心/顶部/左上），"
+            "一键应用到全部帧、一键脚底对齐，消掉帧间抖动")
+        self.btn_adjust.clicked.connect(self._open_frame_adjust)
+        bar2.addWidget(self.btn_adjust)
         self.btn_export = QPushButton("导出...")
         self.btn_export.setProperty("accent", True)
         menu = QMenu(self)
@@ -204,6 +210,32 @@ class AnimPlayer(QWidget):
         self.status(f"已载入 {len(self._frames)} 帧（{name}），FPS {self.slider_fps.value()}")
 
     # ---------------- 多动画组 ----------------
+
+    def _open_frame_adjust(self) -> None:
+        """⇕ 逐帧位移/缩放：对当前动画帧统一画布调节（不重新底对齐）。"""
+        from PySide6.QtWidgets import QDialog
+        from pixelforge.ui.image_lab import FrameAdjustDialog
+        if not self._frames:
+            self.status("没有可调节的帧——先拖入 GIF/帧目录或从工具坊发送")
+            return
+        dlg = FrameAdjustDialog(self._frames, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        frames = dlg.result_frames()
+        if not frames:
+            return
+        self._frames = [f.copy() for f in frames]   # 不走 _normalize：保留用户位移
+        self._pos = 0
+        self._ping_dir = 1
+        self._timer.stop()
+        self.btn_play.setText("▶ 播放")
+        cur = self.cmb_clips.currentText()
+        if cur in self._clips:
+            self._clips[cur] = list(self._frames)   # 同步当前动画组
+        self._rebuild_strip()
+        self._render()
+        h, w = frames[0].shape[:2]
+        self.status(f"已应用逐帧位移/缩放：{len(frames)} 帧 → 统一画布 {w}x{h}")
 
     def _sync_clips_combo(self, current: str) -> None:
         self.cmb_clips.blockSignals(True)

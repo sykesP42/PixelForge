@@ -189,6 +189,43 @@ def main() -> int:
     p.chk_onion.setChecked(False)
     print("[OK] 洋葱皮: 前红/后蓝残影叠加，范围可调，边界帧安全")
 
+    # 16. 逐帧位移/缩放：入口在播放器，应用后保留用户位移（不再底对齐）
+    from PySide6.QtWidgets import QDialog as _QD
+    from pixelforge.ui.image_lab import FrameAdjustDialog
+
+    def _fake_exec(self):
+        self.sp_dx.setValue(5)
+        self._broadcast()
+        return _QD.Accepted
+
+    def _rel_x(fp: np.ndarray) -> float:
+        """内容水平中心相对「自身画布中心」的偏移。"""
+        ys, xs = np.where(fp[:, :, 3] > 0)
+        return float(xs.mean()) - fp.shape[1] / 2.0
+
+    p.set_frames(make_frames(), name="adj")
+    orig_exec = FrameAdjustDialog.exec
+    FrameAdjustDialog.exec = _fake_exec
+    try:
+        rel0 = [_rel_x(f) for f in p._frames]
+        p._open_frame_adjust()
+        assert len(p._frames) == 3, "帧数应保持 3"
+        assert p._frames[0].shape == p._frames[2].shape, "应用后应统一画布"
+        rel1 = [_rel_x(f) for f in p._frames]
+        for a, b in zip(rel0, rel1):
+            assert abs((b - a) - 5.0) < 1e-6, \
+                f"全部帧相对画布中心应右移 5px: {a:.1f}->{b:.1f}"
+        assert len(p._clips.get("adj", [])) == 3, "当前动画组应同步更新"
+        h, w = p._frames[0].shape[:2]
+        assert all(f.shape[:2] == (h, w) for f in p._frames)
+    finally:
+        FrameAdjustDialog.exec = orig_exec
+    # 空帧守卫：不崩且给出状态提示
+    p._frames = []
+    p._open_frame_adjust()   # 仅应写状态，不应抛异常
+    p.set_frames(make_frames(), name="test")
+    print("[OK] 逐帧位移/缩放: 播放器入口一键应用（右移 5px 保留，不重新底对齐）+ 动画组同步")
+
     print("\n动画播放器全部测试通过 ✔")
     return 0
 

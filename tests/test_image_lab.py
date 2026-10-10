@@ -234,10 +234,8 @@ def main() -> int:
     assert any("A/B" in m for m in msgs), f"应有空态提示: {msgs}"
     print("[OK] A/B 对比: 弹窗/分割线拖动与边界收敛/尺寸对齐/空态提示")
 
-    # 17. 逐帧位移/缩放：对话框逻辑 + 一键应用到全部帧 + 撤销
-    from PySide6.QtWidgets import QDialog as _QD
+    # 17. 逐帧位移/缩放：对话框逻辑（入口在动画播放器，见 test_anim_player）
     from pixelforge.ui.image_lab import FrameAdjustDialog
-    from pixelforge.ui import image_lab as il_mod
 
     fa = np.zeros((10, 10, 4), np.uint8)
     fa[2:8, 2:8] = (0, 0, 255, 255)
@@ -273,36 +271,6 @@ def main() -> int:
     dlg._refresh()
     assert dlg.pv.pixmap() is not None and not dlg.pv.pixmap().isNull()
     print("[OK] 逐帧位移/缩放: 参数写入/广播/脚底对齐/预览渲染")
-
-    # 17b. 面板入口：一键应用到全部帧 + 撤销回退
-    def _fake_exec(self):
-        self.sp_dx.setValue(5)
-        self._broadcast()
-        return _QD.Accepted
-
-    def _rel_x(fp: np.ndarray) -> float:
-        """内容水平中心相对「自身画布中心」的偏移（等价播放器的居中归一化）。"""
-        ys, xs = np.where(fp[:, :, 3] > 0)
-        return float(xs.mean()) - fp.shape[1] / 2.0
-
-    orig_exec = FrameAdjustDialog.exec
-    FrameAdjustDialog.exec = _fake_exec
-    try:
-        rel0 = [_rel_x(f) for f in lab._frames]
-        lab._open_frame_adjust()
-        assert len(lab._frames) == 2
-        assert lab._frames[0].shape == lab._frames[1].shape, "应用后应统一画布"
-        rel1 = [_rel_x(f) for f in lab._frames]
-        for a, b in zip(rel0, rel1):
-            assert abs((b - a) - 5.0) < 1e-6, \
-                f"两帧相对画布中心都应右移 5px: {a:.1f}->{b:.1f}"
-        lab.undo()
-        assert [f.shape for f in lab._frames] == [fa.shape, fb.shape], \
-            "撤销应恢复原始帧尺寸"
-    finally:
-        FrameAdjustDialog.exec = orig_exec
-    del il_mod
-    print("[OK] 逐帧位移/缩放: 面板入口一键应用（全部帧相对画布中心右移 5px）+ 撤销回退")
 
     # 18. waifu2x：工具坊入口（同步打桩）→ 画布替换 + 撤销 + 进度文案
     from pixelforge.ui.w2x_worker import Waifu2xWorker
