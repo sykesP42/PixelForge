@@ -151,6 +151,88 @@ def tween_x2(frames: list[np.ndarray]) -> list[np.ndarray]:
     return out
 
 
+def adjust_frames(frames: list[np.ndarray],
+                  offsets: list[tuple[int, int]] | None = None,
+                  scales: list[float] | None = None,
+                  anchor: tuple[float, float] = (0.5, 0.5),
+                  ) -> list[np.ndarray]:
+    """逐帧调节位移与缩放，输出统一画布的帧序列。
+
+    参数
+    ----
+    frames  : BGRA 帧列表（各帧尺寸可不同）
+    offsets : 每帧 (dx, dy) 像素位移，可正可负；None = 全 0
+    scales  : 每帧缩放系数（1.0 原样）；None = 全 1.0
+    anchor  : (ax, ay) 归一化锚点，缩放与画布内对位的基准。
+              常用 (0.5, 0.5)=中心 / (0.5, 1.0)=脚底中心 / (0, 0)=左上
+
+    画布尺寸 = 各帧缩放后的最大宽高，四周再加 pad 容纳最大位移量，
+    因此任何合法的位移/缩放都不会裁掉内容。
+    """
+    if not frames:
+        return []
+    n = len(frames)
+    if offsets is None:
+        offsets = [(0, 0)] * n
+    if scales is None:
+        scales = [1.0] * n
+    if len(offsets) != n or len(scales) != n:
+        raise ValueError("offsets/scales 长度必须与 frames 一致")
+
+    ax, ay = float(anchor[0]), float(anchor[1])
+    scaled: list[np.ndarray] = []
+    for a, s in zip(frames, scales):
+        if a.ndim == 2:
+            a = cv2.cvtColor(a, cv2.COLOR_GRAY2BGRA)
+        elif a.shape[2] == 3:
+            a = cv2.cvtColor(a, cv2.COLOR_BGR2BGRA)
+        s = max(0.01, float(s))
+        nw = max(1, int(round(a.shape[1] * s)))
+        nh = max(1, int(round(a.shape[0] * s)))
+        if (nw, nh) == (a.shape[1], a.shape[0]):
+            scaled.append(a)
+        else:
+            interp = cv2.INTER_NEAREST if s >= 1.0 else cv2.INTER_AREA
+            scaled.append(cv2.resize(a, (nw, nh), interpolation=interp))
+
+    max_w = max(f.shape[1] for f in scaled)
+    max_h = max(f.shape[0] for f in scaled)
+    pad_x = max(abs(int(dx)) for dx, _ in offsets)
+    pad_y = max(abs(int(dy)) for _, dy in offsets)
+    canvas_w = max_w + 2 * pad_x
+    canvas_h = max_h + 2 * pad_y
+
+    out: list[np.ndarray] = []
+    for f, (dx, dy) in zip(scaled, offsets):
+        canvas = np.zeros((canvas_h, canvas_w, 4), np.uint8)
+        # 先按锚点在 max_w x max_h 区域内对位，再叠加位移
+        bx = int(round(ax * max_w - ax * f.shape[1]))
+        by = int(round(ay * max_h - ay * f.shape[0]))
+        x0 = pad_x + bx + int(dx)
+        y0 = pad_y + by + int(dy)
+        fh, fw = f.shape[:2]
+        # 与画布求交（数学上恒在内，仍做一次保护）
+        sx0, sy0 = max(0, -x0), max(0, -y0)
+        dx0, dy0 = max(0, x0), max(0, y0)
+        w = min(fw - sx0, canvas_w - dx0)
+        h = min(fh - sy0, canvas_h - dy0)
+        if w <= 0 or h <= 0:
+            out.append(canvas)
+            continue
+        src = f[sy0:sy0 + h, sx0:sx0 + w]
+        region = canvas[dy0:dy0 + h, dx0:dx0 + w]
+        al = src[:, :, 3:4].astype(np.float32) / 255.0
+        region[:] = (src.astype(np.float32) * al
+                     + region.astype(np.float32) * (1 - al)).astype(np.uint8)
+        out.append(canvas)
+    return out
+
+
+def align_frames_baseline(frames: list[np.ndarray]) -> list[np.ndarray]:
+    """一键基线对齐：统一画布到最大尺寸，各帧底边+水平中心对齐（脚底不漂移）。"""
+    return adjust_frames(frames, anchor=(0.5, 1.0))
+
+
 def load_gif_frames(path) -> list[np.ndarray]:
     """GIF/APNG 逐帧导入为 BGRA 列表（PIL 处理帧合成与处置）。"""
     from PIL import Image, ImageSequence

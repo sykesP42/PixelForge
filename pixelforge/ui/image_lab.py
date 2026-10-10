@@ -7,6 +7,7 @@
 - A/B 对比：弹出对比窗口，左=原图(A) 右=当前(B)，黄色分割线可拖动比对
 - 智能单帧：整体内容紧致化输出 1 帧（单角色图不再被网格切碎）
 - 自动裁切双模式：连通域 / 网格切分（行 x 列）
+- 逐帧位移/缩放：裁切后逐帧调位移与缩放（锚点：中心/脚底/左上），一键应用到全部帧、一键脚底对齐
 - 自由裁切：画布叠加裁切框，拖四边微调 / 框内整体移动 / 框外拖动新建框
 - 放大镜：鼠标位置实时放大预览（可开关），配合裁切线/画笔精确操作
 - 常用编辑：亮度/对比度/饱和度（带数值显示）、旋转90°、水平/垂直翻转、手动裁边
@@ -149,6 +150,249 @@ class _ABCompare(QWidget):
         self.update()
 
 
+def _checker_bg(bgra: np.ndarray, cell: int = 8) -> np.ndarray:
+    """把 BGRA 帧合成到棋盘底上，返回 BGRA（alpha=255）便于预览透明区。"""
+    h, w = bgra.shape[:2]
+    ys, xs = np.mgrid[0:h, 0:w]
+    dark = ((ys // cell + xs // cell) % 2 == 0)
+    bg = np.empty((h, w, 3), np.uint8)
+    bg[dark] = (60, 60, 64)
+    bg[~dark] = (88, 88, 94)
+    al = bgra[:, :, 3:4].astype(np.float32) / 255.0
+    rgb = (bgra[:, :, :3].astype(np.float32) * al
+           + bg.astype(np.float32) * (1 - al)).astype(np.uint8)
+    return np.dstack([rgb, np.full((h, w), 255, np.uint8)])
+
+
+class FrameAdjustDialog(QDialog):
+    """逐帧位移 / 缩放调节：左帧条 · 中预览（棋盘底）· 右参数。
+
+    所有帧共用一套画布：画布 = 缩放后的最大宽高 + 位移余量，
+    因此位移/缩放不会裁掉内容；「一键应用到全部帧」把当前帧参数广播给所有帧。
+    """
+
+    ANCHORS = [("中心", (0.5, 0.5)), ("脚底中心", (0.5, 1.0)),
+               ("顶部中心", (0.5, 0.0)), ("左上", (0.0, 0.0))]
+
+    def __init__(self, frames: list[np.ndarray], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("逐帧位移 / 缩放（裁切后对齐用）")
+        self.resize(1000, 660)
+        self._frames = [f if f.shape[2] == 4 else _norm_bgra(f) for f in frames]
+        n = len(self._frames)
+        self._dx = [0] * n
+        self._dy = [0] * n
+        self._sc = [1.0] * n
+        self._idx = 0
+        self._syncing = False
+        self._build()
+        self.lst.setCurrentRow(0)
+
+    # ---------- UI ----------
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+        body = QHBoxLayout()
+        # 左：帧条
+        self.lst = QListWidget()
+        self.lst.setObjectName("frameStrip")
+        self.lst.setIconSize(QSize(64, 64))
+        self.lst.setViewMode(QListWidget.IconMode)
+        self.lst.setResizeMode(QListWidget.Adjust)
+        self.lst.setMaximumWidth(250)
+        self.lst.currentRowChanged.connect(self._on_row)
+        body.addWidget(self.lst, 0)
+        # 中：预览
+        self.pv = QLabel("逐帧调节预览")
+        self.pv.setObjectName("genPreview")
+        self.pv.setAlignment(Qt.AlignCenter)
+        self.pv.setMinimumSize(380, 380)
+        self.pv.setWordWrap(True)
+        body.addWidget(self.pv, 1)
+        # 右：参数
+        right = QVBoxLayout()
+        form = QFormLayout()
+        self.sp_dx = QSpinBox()
+        self.sp_dx.setRange(-999, 999)
+        self.sp_dx.setSuffix(" px")
+        self.sp_dy = QSpinBox()
+        self.sp_dy.setRange(-999, 999)
+        self.sp_dy.setSuffix(" px")
+        self.sp_sc = QSpinBox()
+        self.sp_sc.setRange(10, 400)
+        self.sp_sc.setValue(100)
+        self.sp_sc.setSuffix(" %")
+        self.cmb_anchor = QComboBox()
+        for name, _a in self.ANCHORS:
+            self.cmb_anchor.addItem(name)
+        form.addRow("X 位移", self.sp_dx)
+        form.addRow("Y 位移", self.sp_dy)
+        form.addRow("缩放", self.sp_sc)
+        form.addRow("缩放/对齐锚点", self.cmb_anchor)
+        right.addLayout(form)
+        self.lbl_info = QLabel("")
+        self.lbl_info.setStyleSheet("color:#8a8f98; font-size:11px;")
+        self.lbl_info.setWordWrap(True)
+        right.addWidget(self.lbl_info)
+        b_cur = QPushButton("↺ 重置当前帧")
+        b_cur.clicked.connect(self._reset_current)
+        right.addWidget(b_cur)
+        b_cast = QPushButton("⇉ 一键应用到全部帧")
+        b_cast.setProperty("accent", True)
+        b_cast.setToolTip("把当前帧的位移/缩放参数复制给所有帧（一键对齐）")
+        b_cast.clicked.connect(self._broadcast)
+        right.addWidget(b_cast)
+        b_base = QPushButton("📐 一键脚底对齐")
+        b_base.setToolTip("锚点设为脚底中心、所有帧归零 —— 消掉帧间上下抖动")
+        b_base.clicked.connect(self._baseline)
+        right.addWidget(b_base)
+        b_all = QPushButton("↺ 重置全部帧")
+        b_all.clicked.connect(self._reset_all)
+        right.addWidget(b_all)
+        right.addStretch(1)
+        body.addLayout(right, 0)
+        lay.addLayout(body, 1)
+        tip = QLabel("位移负值=左/上，正值=右/下｜缩放 100% = 原样｜"
+                     "「一键应用到全部帧」把当前帧参数广播给所有帧后点下方「应用并生成」")
+        tip.setStyleSheet("color:#8a8f98; font-size:11px;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_ok = QPushButton("✅ 应用并生成")
+        b_ok.setProperty("accent", True)
+        b_ok.clicked.connect(self.accept)
+        row.addWidget(b_ok)
+        b_cancel = QPushButton("取消")
+        b_cancel.clicked.connect(self.reject)
+        row.addWidget(b_cancel)
+        lay.addLayout(row)
+
+        for sp in (self.sp_dx, self.sp_dy, self.sp_sc):
+            sp.valueChanged.connect(self._on_param)
+        self.cmb_anchor.currentIndexChanged.connect(lambda _: self._refresh())
+        self._rebuild_list()
+
+    # ---------- 数据 ----------
+
+    def _offset(self) -> tuple[int, int]:
+        return int(self.sp_dx.value()), int(self.sp_dy.value())
+
+    def _scale(self) -> float:
+        return self.sp_sc.value() / 100.0
+
+    def _anchor(self) -> tuple[float, float]:
+        return self.ANCHORS[self.cmb_anchor.currentIndex()][1]
+
+    def _rebuild_list(self) -> None:
+        self.lst.blockSignals(True)
+        self.lst.clear()
+        for i, a in enumerate(self._frames):
+            it = QListWidgetItem()
+            self.lst.addItem(it)
+            self._fill_item(it, i)
+        self.lst.blockSignals(False)
+
+    def _fill_item(self, it: QListWidgetItem, i: int) -> None:
+        it.setText(f"#{i} {self._frames[i].shape[1]}x{self._frames[i].shape[0]}\n"
+                   f"d({self._dx[i]},{self._dy[i]}) ×{self._sc[i]:.2f}")
+        pm = _to_pixmap(self._frames[i]).scaled(
+            64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        it.setIcon(QIcon(pm))
+
+    def _current(self, frames: list[np.ndarray]) -> np.ndarray:
+        return frames[min(max(self._idx, 0), len(frames) - 1)]
+
+    def _compute(self) -> list[np.ndarray]:
+        return editing.adjust_frames(
+            self._frames,
+            offsets=[(self._dx[i], self._dy[i]) for i in range(len(self._frames))],
+            scales=list(self._sc), anchor=self._anchor())
+
+    def result_frames(self) -> list[np.ndarray]:
+        return self._compute() if self._frames else []
+
+    # ---------- 交互 ----------
+
+    def _on_row(self, row: int) -> None:
+        if row < 0 or not self._frames:
+            return
+        self._idx = row
+        self._syncing = True
+        self.sp_dx.setValue(self._dx[row])
+        self.sp_dy.setValue(self._dy[row])
+        self.sp_sc.setValue(int(round(self._sc[row] * 100)))
+        self._syncing = False
+        self._refresh()
+
+    def _on_param(self, _v) -> None:
+        if self._syncing or not self._frames:
+            return
+        i = self._idx
+        self._dx[i], self._dy[i] = self._offset()
+        self._sc[i] = self._scale()
+        self._fill_item(self.lst.item(i), i)
+        self._refresh()
+
+    def _reset_current(self) -> None:
+        if not self._frames:
+            return
+        i = self._idx
+        self._dx[i], self._dy[i], self._sc[i] = 0, 0, 1.0
+        self._on_row(i)
+
+    def _reset_all(self) -> None:
+        n = len(self._frames)
+        self._dx, self._dy, self._sc = [0] * n, [0] * n, [1.0] * n
+        self._rebuild_list()
+        self._on_row(self._idx)
+
+    def _broadcast(self) -> None:
+        """一键应用：把当前帧参数复制给全部帧。"""
+        if not self._frames:
+            return
+        dx, dy, sc = self._dx[self._idx], self._dy[self._idx], self._sc[self._idx]
+        for i in range(len(self._frames)):
+            self._dx[i], self._dy[i], self._sc[i] = dx, dy, sc
+        self._rebuild_list()
+        self._on_row(self._idx)
+
+    def _baseline(self) -> None:
+        """一键脚底对齐：锚点=脚底中心，参数全部归零。"""
+        if not self._frames:
+            return
+        self.cmb_anchor.setCurrentIndex(1)   # 脚底中心
+        self._reset_all()
+
+    def _refresh(self) -> None:
+        if not self._frames:
+            self.pv.setText("没有可调节的帧")
+            return
+        frames = self._compute()
+        self._refresh_items_geom(frames)
+        cur = _checker_bg(self._current(frames))
+        pm = _to_pixmap(cur)
+        target = self.pv.size()
+        if target.width() > 20 and target.height() > 20:
+            pm = pm.scaled(target.width() - 8, target.height() - 8,
+                           Qt.KeepAspectRatio, Qt.FastTransformation)
+        self.pv.setPixmap(pm)
+        h, w = frames[0].shape[:2]
+        n_moved = sum(1 for i in range(len(self._frames))
+                      if self._dx[i] or self._dy[i] or abs(self._sc[i] - 1.0) > 1e-6)
+        self.lbl_info.setText(
+            f"当前 #{self._idx}（共 {len(self._frames)} 帧）｜已调整 {n_moved} 帧\n"
+            f"生成画布：{w}x{h} px（全部帧统一）")
+
+    def _refresh_items_geom(self, frames: list[np.ndarray]) -> None:
+        """列表项显示缩放后的实际尺寸，参数改动后同步。"""
+        for i in range(self.lst.count()):
+            f = frames[min(i, len(frames) - 1)]
+            self.lst.item(i).setText(
+                f"#{i} {f.shape[1]}x{f.shape[0]}\n"
+                f"d({self._dx[i]},{self._dy[i]}) ×{self._sc[i]:.2f}")
+
+
 class _MacroWorker(QThread):
     """后台线程执行宏批量回放，避免阻塞 UI。"""
     done = Signal(int)
@@ -177,7 +421,7 @@ class ImageLab(QWidget):
         self.arr: np.ndarray | None = None
         self._orig: np.ndarray | None = None      # 打开时的原图（恢复/对比用）
         self.path: Path | None = None
-        self._undo: list[np.ndarray] = []
+        self._undo: list[tuple[str, object]] = []  # ("arr"|"frames", 快照)
         self._zoom = 1.0
         self._frames: list[np.ndarray] = []
         self._preview: np.ndarray | None = None   # 色键实时预览（未提交）
@@ -522,12 +766,32 @@ class ImageLab(QWidget):
         bp = QPushButton("发送到动画播放器")
         bp.clicked.connect(self.send_to_player)
         vb.addWidget(bp)
+        ba = QPushButton("⇕ 逐帧位移/缩放...")
+        ba.setToolTip("裁切后逐帧调位移与缩放：一键应用/一键脚底对齐，消掉帧间抖动")
+        ba.clicked.connect(self._open_frame_adjust)
+        vb.addWidget(ba)
         bf = QPushButton("保存全部帧...")
         bf.clicked.connect(self.save_frames)
         vb.addWidget(bf)
         vb.addStretch(1)
         h.addLayout(vb)
         return w
+
+    def _open_frame_adjust(self) -> None:
+        """逐帧位移/缩放调节对话框（裁切后对齐用）。"""
+        if not self._frames:
+            self.status("请先裁切出帧，再调节每帧位移/缩放")
+            return
+        dlg = FrameAdjustDialog(self._frames, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        frames = dlg.result_frames()
+        if not frames:
+            return
+        self._push_undo_frames()
+        self._set_frames(frames)
+        h, w = frames[0].shape[:2]
+        self.status(f"已应用逐帧位移/缩放：{len(frames)} 帧 → 统一画布 {w}x{h}")
 
     # ---------------- 文件 ----------------
 
@@ -629,18 +893,32 @@ class ImageLab(QWidget):
     # ---------------- 撤销 ----------------
 
     def _push_undo(self) -> None:
+        """记录当前画布快照（撤销用）。"""
         if self.arr is not None:
-            self._undo.append(self.arr.copy())
+            self._undo.append(("arr", self.arr.copy()))
+            if len(self._undo) > 20:
+                self._undo.pop(0)
+
+    def _push_undo_frames(self) -> None:
+        """记录当前帧列表快照（逐帧位移/缩放等帧级操作撤销用）。"""
+        if self._frames:
+            self._undo.append(("frames", [f.copy() for f in self._frames]))
             if len(self._undo) > 20:
                 self._undo.pop(0)
 
     def undo(self) -> None:
-        if self._undo:
-            self.arr = self._undo.pop()
+        if not self._undo:
+            return
+        kind, payload = self._undo.pop()
+        if kind == "frames":
+            self._frames = payload
+            self._set_frames(self._frames, quiet=True)
+        else:
+            self.arr = payload
             self._preview = None
             self._crop_rect = None
             self._render()
-            self.status("已撤销")
+        self.status("已撤销")
 
     def reset(self) -> None:
         if self._orig is None:
@@ -971,7 +1249,7 @@ class ImageLab(QWidget):
         self._set_frames(frames)
         self.status(f"网格切分: {len(frames)} 帧")
 
-    def _set_frames(self, frames: list[np.ndarray]) -> None:
+    def _set_frames(self, frames: list[np.ndarray], quiet: bool = False) -> None:
         self._frames = frames
         self.lst_frames.clear()
         for i, a in enumerate(frames):
@@ -979,7 +1257,7 @@ class ImageLab(QWidget):
             pm = _to_pixmap(a).scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             it.setIcon(QIcon(pm))
             self.lst_frames.addItem(it)
-        if not frames:
+        if not frames and not quiet:
             QMessageBox.information(self, "图像工具坊", "未检测到帧（画面全空？）")
 
     def send_to_player(self) -> None:

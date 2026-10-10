@@ -234,6 +234,76 @@ def main() -> int:
     assert any("A/B" in m for m in msgs), f"应有空态提示: {msgs}"
     print("[OK] A/B 对比: 弹窗/分割线拖动与边界收敛/尺寸对齐/空态提示")
 
+    # 17. 逐帧位移/缩放：对话框逻辑 + 一键应用到全部帧 + 撤销
+    from PySide6.QtWidgets import QDialog as _QD
+    from pixelforge.ui.image_lab import FrameAdjustDialog
+    from pixelforge.ui import image_lab as il_mod
+
+    fa = np.zeros((10, 10, 4), np.uint8)
+    fa[2:8, 2:8] = (0, 0, 255, 255)
+    fb = np.zeros((20, 6, 4), np.uint8)
+    fb[2:18, 1:5] = (0, 255, 0, 255)
+    lab._set_frames([fa.copy(), fb.copy()], quiet=True)
+
+    # 17a. 对话框内部逻辑
+    dlg = FrameAdjustDialog([fa.copy(), fb.copy()])
+    assert dlg._dx == [0, 0] and dlg._dy == [0, 0] and dlg._sc == [1.0, 1.0], \
+        "初始参数应为单位值"
+    assert dlg._anchor() == (0.5, 0.5), "默认锚点为中心"
+    dlg.sp_sc.setValue(200)                  # 改当前帧(0) 缩放 2x
+    assert abs(dlg._sc[0] - 2.0) < 1e-6, f"缩放应写入当前帧: {dlg._sc}"
+    assert abs(dlg._sc[1] - 1.0) < 1e-6, "未选中帧不应被改动"
+    dlg.sp_dx.setValue(4)
+    assert dlg._dx[0] == 4
+    dlg._broadcast()                         # 一键应用到全部帧
+    assert dlg._dx == [4, 4] and dlg._sc == [2.0, 2.0], \
+        f"广播后全部帧参数应一致: dx={dlg._dx} sc={dlg._sc}"
+    res = dlg.result_frames()
+    assert len(res) == 2 and res[0].shape == res[1].shape, "结果应统一画布"
+    assert res[0].shape[1] > fb.shape[1], "2x 缩放后画布应放大"
+    dlg._baseline()                          # 一键脚底对齐
+    assert dlg._anchor() == (0.5, 1.0), "锚点应切到脚底中心"
+    assert dlg._dx == [0, 0] and dlg._sc == [1.0, 1.0], "对齐应把参数归零"
+    base = dlg.result_frames()
+    bots = []
+    for o in base:
+        ys, xs = np.where(o[:, :, 3] > 0)
+        bots.append(int(ys.max()))
+    assert bots[0] == bots[1], f"脚底对齐后底线应一致: {bots}"
+    dlg._refresh()
+    assert dlg.pv.pixmap() is not None and not dlg.pv.pixmap().isNull()
+    print("[OK] 逐帧位移/缩放: 参数写入/广播/脚底对齐/预览渲染")
+
+    # 17b. 面板入口：一键应用到全部帧 + 撤销回退
+    def _fake_exec(self):
+        self.sp_dx.setValue(5)
+        self._broadcast()
+        return _QD.Accepted
+
+    def _rel_x(fp: np.ndarray) -> float:
+        """内容水平中心相对「自身画布中心」的偏移（等价播放器的居中归一化）。"""
+        ys, xs = np.where(fp[:, :, 3] > 0)
+        return float(xs.mean()) - fp.shape[1] / 2.0
+
+    orig_exec = FrameAdjustDialog.exec
+    FrameAdjustDialog.exec = _fake_exec
+    try:
+        rel0 = [_rel_x(f) for f in lab._frames]
+        lab._open_frame_adjust()
+        assert len(lab._frames) == 2
+        assert lab._frames[0].shape == lab._frames[1].shape, "应用后应统一画布"
+        rel1 = [_rel_x(f) for f in lab._frames]
+        for a, b in zip(rel0, rel1):
+            assert abs((b - a) - 5.0) < 1e-6, \
+                f"两帧相对画布中心都应右移 5px: {a:.1f}->{b:.1f}"
+        lab.undo()
+        assert [f.shape for f in lab._frames] == [fa.shape, fb.shape], \
+            "撤销应恢复原始帧尺寸"
+    finally:
+        FrameAdjustDialog.exec = orig_exec
+    del il_mod
+    print("[OK] 逐帧位移/缩放: 面板入口一键应用（全部帧相对画布中心右移 5px）+ 撤销回退")
+
     print("\n图像工具坊全部测试通过 ✔")
     return 0
 

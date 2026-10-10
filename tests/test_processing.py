@@ -112,6 +112,53 @@ def main() -> int:
     assert (TMP / "cli_out" / "synth_sheet.atlas.json").is_file()
     print("[OK] CLI 端到端运行成功")
 
+    # ---- 逐帧位移/缩放（editing.adjust_frames） ----
+    from pixelforge.processing import editing
+
+    f1 = np.zeros((10, 10, 4), np.uint8)
+    f1[2:8, 2:8] = (0, 0, 255, 255)
+    f2 = np.zeros((20, 6, 4), np.uint8)
+    f2[2:18, 1:5] = (0, 255, 0, 255)
+
+    # 全零参数：画布 = 各帧最大尺寸，无多余留白
+    out = editing.adjust_frames([f1, f2])
+    assert [o.shape for o in out] == [(20, 10, 4), (20, 10, 4)], \
+        f"画布应统一为 10x20: {[o.shape for o in out]}"
+    assert not np.array_equal(out[0], out[1])
+    print(f"[OK] adjust_frames: 统一画布 {out[0].shape[1]}x{out[0].shape[0]}")
+
+    # 位移：画布四周扩出最大位移量，内容不丢
+    out = editing.adjust_frames([f1, f2], offsets=[(3, -2), (0, 0)],
+                                scales=[2.0, 1.0])
+    assert out[0].shape == out[1].shape
+    ys, xs = np.where(out[0][:, :, 3] > 0)
+    assert ys.size == 6 * 6 * 4, f"放大 2x 后像素数应为 144: {ys.size}"
+    assert out[0].shape[0] >= 20 + 4 and out[0].shape[1] >= 20 + 6
+    print(f"[OK] adjust_frames: 位移+缩放 2x → 画布 {out[0].shape[1]}x{out[0].shape[0]}，内容完整")
+
+    # 缩放 50%：像素数按面积缩到 1/4
+    half = editing.adjust_frames([f1], scales=[0.5])[0]
+    assert int((half[:, :, 3] > 0).sum()) == 6 * 6 // 4, "0.5x 应缩到 1/4 像素"
+    print("[OK] adjust_frames: 缩小 0.5x 像素数 = 1/4")
+
+    # 脚底中心锚点：位移之后同一锚点仍对齐（帧内底部带中心 x 一致）
+    out = editing.align_frames_baseline([f1, f2])
+    bots = []
+    for o in out:
+        ys, xs = np.where(o[:, :, 3] > 0)
+        bots.append((int(ys.max()), float(xs.mean())))
+    assert bots[0][0] == bots[1][0], f"脚底基线应一致: {bots}"
+    assert abs(bots[0][1] - bots[1][1]) < 1e-6, f"水平中心应一致: {bots}"
+    print(f"[OK] align_frames_baseline: 两帧底边同为 y={bots[0][0]}，水平居中")
+
+    # 长度不匹配应报错
+    try:
+        editing.adjust_frames([f1, f2], offsets=[(0, 0)])
+        raise AssertionError("长度不匹配应抛 ValueError")
+    except ValueError:
+        pass
+    print("[OK] adjust_frames: 参数长度校验")
+
     print("\n阶段2 全部测试通过 ✔")
     return 0
 
