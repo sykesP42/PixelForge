@@ -9,6 +9,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_FILE = PROJECT_ROOT / "config" / "settings.json"
 CHARACTERS_FILE = PROJECT_ROOT / "config" / "characters.json"
 
+# 旧版出厂默认负面词（2026-10 起弃用，load 时一次性清除，需要可自行在 UI 填回）
+_LEGACY_NEGATIVE = "blurry, low quality, watermark, text"
+
 
 @dataclass
 class Settings:
@@ -29,7 +32,7 @@ class Settings:
     checkpoint: str = ""
     output_dir: str = "outputs"
     prompt: str = ""
-    negative_prompt: str = "blurry, low quality, watermark, text"
+    negative_prompt: str = ""           # 负面提示词（默认空，按需自填）
     steps: int = 20
     cfg: float = 7.0
     width: int = 512
@@ -76,7 +79,10 @@ class Settings:
         try:
             data = json.loads(CONFIG_FILE.read_text("utf-8"))
             known = {f: data[f] for f in cls.__dataclass_fields__ if f in data}
-            return cls(**known)
+            s = cls(**known)
+            if s.negative_prompt == _LEGACY_NEGATIVE:
+                s.negative_prompt = ""   # 旧版默认负面词一次性清除
+            return s
         except (OSError, json.JSONDecodeError, TypeError):
             return cls()
 
