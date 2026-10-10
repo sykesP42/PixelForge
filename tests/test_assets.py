@@ -179,6 +179,25 @@ def main() -> int:
     assert len(got_x) == 1 and got_x[0].name == "grid_run.png"
     print("[OK] 9. 生成素材信号: 替换(gen_material) + 附属(gen_material_extra)")
 
+    # 模糊搜索：名称子串 / 顺序子序列 / 多词与 / 提示词命中 / 清空复原
+    panel.cmb_filter.setCurrentText("全部")
+    panel.cmb_folder.setCurrentText("全部文件夹")
+    total = panel.lst.count()
+    panel.ed_search.setText("knight")
+    assert panel.lst.count() == 1, f"名称子串应命中 1: {panel.lst.count()}"
+    panel.ed_search.setText("kngt")     # 顺序子序列 -> knight
+    assert panel.lst.count() == 1, f"子序列应命中 knight: {panel.lst.count()}"
+    panel.ed_search.setText("knight idle")   # 多词与
+    assert panel.lst.count() == 1, f"多词与应命中 1: {panel.lst.count()}"
+    panel.ed_search.setText("cycle")    # 命中提示词 -> grid_run
+    assert panel.lst.count() == 1 and "grid" in panel.lst.item(0).text(), \
+        f"提示词命中失败: {panel.lst.count()}"
+    panel.ed_search.setText("zzz")      # 无命中
+    assert panel.lst.count() == 0
+    panel.ed_search.setText("")         # 清空复原
+    assert panel.lst.count() == total, f"清空应复原 {total}: {panel.lst.count()}"
+    print("[OK] 10. 模糊搜索: 子串/子序列/多词与/提示词命中/清空复原")
+
     print("\n资产库面板测试全部通过 ✔")
     return 0
 

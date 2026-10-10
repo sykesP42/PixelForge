@@ -22,8 +22,8 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QHBoxLayout, QInputDialog, QLabel,
-    QListWidget, QListWidgetItem, QMenu, QMessageBox, QPushButton,
-    QVBoxLayout, QWidget,
+    QLineEdit, QListWidget, QListWidgetItem, QMenu, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 CAT_NAMES = {"local": "本地资产", "cloud": "云资产", "generated": "生成资产"}
@@ -86,6 +86,14 @@ class AssetLibraryPanel(QWidget):
              CAT_NAMES["local"], CAT_NAMES["cloud"], CAT_NAMES["generated"]])
         self.cmb_filter.currentIndexChanged.connect(lambda _: self._apply_filter())
         bar.addWidget(self.cmb_filter)
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("🔍 模糊搜索（名称/路径/分类/提示词，空格分词）")
+        self.ed_search.setClearButtonEnabled(True)
+        self.ed_search.setMinimumWidth(220)
+        self.ed_search.setToolTip(
+            "模糊搜索：多个关键词用空格分隔，需全部命中（支持顺序子序列，如 “红披风” 可命中 “红色_披风_idle”）")
+        self.ed_search.textChanged.connect(lambda _: self._apply_filter())
+        bar.addWidget(self.ed_search)
         self.cmb_folder = QComboBox()
         self.cmb_folder.currentTextChanged.connect(self._on_folder_filter)
         bar.addWidget(self.cmb_folder)
@@ -126,7 +134,7 @@ class AssetLibraryPanel(QWidget):
         lay.addWidget(self.lst, 1)
         # 工业软件式操作提示行（常驻底部）
         tips = QLabel("双击=预览打开｜右键=重载/AI修图素材/附属素材/导入提示词/"
-                      "收藏/分类｜框选可多选｜导入=当前分类加图｜切到本页自动刷新")
+                      "收藏/分类｜框选可多选｜🔍搜索支持模糊匹配（空格分词）｜切到本页自动刷新")
         tips.setStyleSheet("color:#8a8f98; font-size:11px;")
         tips.setWordWrap(True)
         lay.addWidget(tips)
@@ -206,12 +214,39 @@ class AssetLibraryPanel(QWidget):
         self._folder_filter = "" if text == "全部文件夹" else text
         self._apply_filter()
 
+    @staticmethod
+    def _fuzzy_hit(text: str, query: str) -> bool:
+        """模糊匹配：query 用空白分词，要求每个词都能在 text 中命中。
+
+        命中方式（满足任一即可）：
+        - 连续子串包含（忽略大小写）；
+        - 顺序子序列：词的字符按序出现在 text 中（如 “红披”→ “红色_披风”）。
+        中英文混排均适用。
+        """
+        if not query:
+            return True
+        t = text.lower()
+        for tok in query.lower().split():
+            if tok in t:
+                continue
+            i = 0
+            for ch in t:
+                if i < len(tok) and ch == tok[i]:
+                    i += 1
+                    if i == len(tok):
+                        break
+            if i < len(tok):
+                return False
+        return True
+
     def _apply_filter(self) -> None:
         mode = self.cmb_filter.currentText()
+        query = self.ed_search.text().strip()
         idx = self._load_index()
         favs = set(idx["favorites"])
         current = self._selected_rels()
         self.lst.clear()
+        hits = 0
         for a in self._assets:
             rel = self._rel(a.path)
             if mode == "动画资产" and a.kind != "anim":
@@ -227,6 +262,13 @@ class AssetLibraryPanel(QWidget):
             folder = idx["folders"].get(rel, "")
             if self._folder_filter and folder != self._folder_filter:
                 continue
+            if query:
+                hay = " ".join([
+                    a.label(), rel, folder,
+                    str(idx["prompts"].get(rel, "") or ""),
+                ])
+                if not self._fuzzy_hit(hay, query):
+                    continue
             tag = folder and f"  📁{folder}"
             it = QListWidgetItem(a.label() + ("  ♥" if rel in favs else "")
                                  + tag)
@@ -236,6 +278,10 @@ class AssetLibraryPanel(QWidget):
             if pm:
                 it.setIcon(QIcon(pm))
             self.lst.addItem(it)
+            hits += 1
+        if query:
+            self.state_changed.emit(
+                f"资产库：搜索「{query}」命中 {hits} 项 / 共 {len(self._assets)} 项")
         if current:
             for i in range(self.lst.count()):
                 if self.lst.item(i).data(Qt.UserRole) in current:
