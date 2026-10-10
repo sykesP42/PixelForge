@@ -275,6 +275,54 @@ def main() -> int:
             QDialog.exec = orig_exec
         assert cap.get("dlg") is None, "缺产物时应拦截不弹窗"
         print("[OK] 11. 历史任务对比：两条选中产物 A/B 并排 + 缺产物拦截")
+
+        # ---------- 12. 一键清空已完成队列 ----------
+        n_before = win.lst_queue.count()
+        cfgmod.upsert_queue_record({"id": "cd1", "status": "done",
+                                    "prompt": "done task"})
+        cfgmod.upsert_queue_record({"id": "cd2", "status": "failed",
+                                    "prompt": "failed task"})
+        win._queue_add_item({"id": "cd1", "status": "done",
+                             "prompt": "done task"})
+        win._queue_add_item({"id": "cd2", "status": "failed",
+                             "prompt": "failed task"})
+        n_with = win.lst_queue.count()
+        assert n_with == n_before + 2
+        QMessageBox.question = lambda *a, **k: QMessageBox.Yes
+        win._queue_clear_done()
+        ids_now = {win._queue_id_of(win.lst_queue.item(i))
+                   for i in range(win.lst_queue.count())}
+        assert "cd1" not in ids_now, "done 条目应被清空"
+        assert "cd2" in ids_now, "failed 条目应保留"
+        assert {r["id"] for r in cfgmod.load_gen_queue()
+                if r["id"] == "cd1"} == set(), "持久化记录应同步移除"
+        # 空清空：不弹窗不崩
+        QMessageBox.question = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("无 done 条目时不应弹窗"))
+        win._queue_clear_done()
+        print("[OK] 12. 一键清空已完成：仅移除 done 条目（文件保留）+ 空态安全")
+
+        # ---------- 13. 多任务聚合进度条 ----------
+        win._gpt_active = 2
+        win._gpt_progress = {1: 40, 2: 80}
+        win._on_gpt_progress("生成阶段 50%", 1)
+        assert win._gpt_progress[1] == 50
+        assert win.pbar.value() == (50 + 80) // 2, \
+            f"应显示聚合均值 65: {win.pbar.value()}"
+        assert "2 个任务并行" in win.pbar.format(), win.pbar.format()
+        # 单任务回落（无 % 日志不影响数值）
+        win._gpt_progress = {2: 80}
+        win._on_gpt_progress("生成中，暂无百分比", 2)
+        assert win.pbar.value() == 80
+        assert win.pbar.format() == "生成中 %p%", win.pbar.format()
+        # 收尾清理
+        win._gpt_active = 1
+        win._task_snaps[2] = {"name": "", "time": ""}
+        win._finish_gpt_task(2)
+        assert 2 not in win._gpt_progress, "收尾应移除该任务进度"
+        assert not win.pbar.isVisible(), "全部结束后进度条应隐藏"
+        win._gpt_active = 0
+        print("[OK] 13. 多任务聚合进度：均值显示 + 并行文案 + 单任务回落 + 收尾清理")
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q

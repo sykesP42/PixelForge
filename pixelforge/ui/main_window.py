@@ -761,6 +761,7 @@ class MainWindow(QMainWindow):
         self._busy = False
         self._task_no = 0
         self._gpt_active = 0          # 并发云端任务数（支持排队同时生成）
+        self._gpt_progress: dict = {}  # task_no -> 百分比（多任务聚合进度条）
         self._gpt_workers: dict = {}  # task_no -> worker（停止用）
         self._task_snaps: dict = {}   # task_no -> 生成快照（登记提示词用）
         self._qid_of_tn: dict = {}    # task_no -> 持久化队列记录 id
@@ -2294,6 +2295,33 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 self.log(f"打开目录失败: {Path(first).parent}")
 
+    def _queue_clear_done(self) -> None:
+        """🧹 一键清空：移除所有状态为「已完成」的队列条目（文件保留）。"""
+        from pixelforge.config import load_gen_queue, save_gen_queue
+        done_ids = {r.get("id") for r in load_gen_queue()
+                    if r.get("status") == "done"}
+        items = [self.lst_queue.item(i)
+                 for i in range(self.lst_queue.count())
+                 if self._queue_id_of(self.lst_queue.item(i)) in done_ids]
+        if not items:
+            self.log("🧹 队列中没有已完成的任务")
+            return
+        r = QMessageBox.question(
+            self, "PixelForge",
+            f"仅从队列移除 {len(items)} 条已完成任务？\n"
+            "（本地文件与资产库保留，可从产物目录找回）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        keep = [rec for rec in load_gen_queue()
+                if rec.get("id") not in done_ids]
+        save_gen_queue(keep)
+        for it in items:
+            self.lst_queue.takeItem(self.lst_queue.row(it))
+        if hasattr(self, "cmb_qfilter"):
+            self._apply_queue_filter()
+        self.log(f"🧹 已清空 {len(items)} 条已完成任务（文件保留）")
+
     def _queue_delete(self, it, purge: bool) -> None:
         """删除队列项；purge=True 时同时删除本地产物文件并从资产库移除。"""
         tid = self._queue_id_of(it)
@@ -2443,6 +2471,11 @@ class MainWindow(QMainWindow):
         self.lbl_qcount = QLabel("")
         self.lbl_qcount.setStyleSheet("color:#8a8f98; font-size:11px;")
         row_qf.addWidget(self.lbl_qcount)
+        self.btn_qclear = QPushButton("🧹 清空已完成")
+        self.btn_qclear.setToolTip(
+            "把所有状态为「已完成」的任务从队列移除（本地文件与资产库保留）")
+        self.btn_qclear.clicked.connect(self._queue_clear_done)
+        row_qf.addWidget(self.btn_qclear)
         lay_log.addLayout(row_qf)
         self.lst_queue = QListWidget()
         self.lst_queue.setObjectName("queueList")
@@ -3013,6 +3046,7 @@ class MainWindow(QMainWindow):
         tn = self._task_no
         self._task_snaps[tn] = {"name": snap.get("name", ""),
                                 "time": snap.get("time", "")}
+        self._gpt_progress[tn] = 0   # 多任务聚合进度：先占位 0%
         from pixelforge.config import upsert_queue_record
         from datetime import datetime as _dt
         _now = _dt.now()
@@ -3041,7 +3075,8 @@ class MainWindow(QMainWindow):
                  f"｜可继续点「生成」排队多任务")
         worker = _GPTEngineWorker(s, actions, refs)
         self._gpt_workers[tn] = worker
-        worker.sig.progress.connect(self._on_gpt_progress)
+        worker.sig.progress.connect(
+            lambda m, t=tn: self._on_gpt_progress(m, t))
         worker.sig.done.connect(lambda paths, t=tn: self._on_gpt_done(paths, t))
         worker.sig.failed.connect(lambda msg, t=tn: self._on_gpt_failed(msg, t))
         QThreadPool.globalInstance().start(worker)
@@ -3061,10 +3096,12 @@ class MainWindow(QMainWindow):
         self._gpt_active = max(0, self._gpt_active - 1)
         self._gpt_workers.pop(tn, None)
         self._task_snaps.pop(tn, None)
+        self._gpt_progress.pop(tn, None)
         if self._gpt_active == 0:
             self.pbar.setVisible(False)
             self.pbar.setRange(0, 100)
             self.pbar.setValue(0)
+            self.pbar.setFormat("生成中 %p%")
             self.btn_stop.setEnabled(False)
         self._update_generate_button_text()
 
@@ -3259,14 +3296,24 @@ class MainWindow(QMainWindow):
         self.chk_gpt.setChecked(True)
         self.log("已从资产库导入生成提示词（含模型/尺寸参数）")
 
-    def _on_gpt_progress(self, msg: str) -> None:
-        """云端进度：含 % 的行更新进度条，其余进日志。"""
+    def _on_gpt_progress(self, msg: str, tn: int | None = None) -> None:
+        """云端进度：含 % 的行更新进度条（多任务聚合均值），其余进日志。"""
         import re as _re
         m = _re.search(r"(\d{1,3})%", msg)
-        if m:
+        if m and tn is not None:
+            self._gpt_progress[tn] = min(100, int(m.group(1)))
+        if self._gpt_progress:
+            vals = list(self._gpt_progress.values())
+            avg = sum(vals) // len(vals)
             self.pbar.setRange(0, 100)
-            self.pbar.setValue(int(m.group(1)))
+            self.pbar.setValue(max(1, avg))
             self.pbar.setVisible(True)
+            if len(vals) > 1:
+                done_n = sum(1 for v in vals if v >= 100)
+                self.pbar.setFormat(
+                    f"{len(vals)} 个任务并行（完成 {done_n}）· 整体 %p%")
+            else:
+                self.pbar.setFormat("生成中 %p%")
         self.log(msg)
 
     def _on_basic_refs_dropped(self, files: list) -> None:
