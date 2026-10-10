@@ -182,6 +182,23 @@ def main() -> int:
         if orig_startfile is not None:
             mw.os.startfile = orig_startfile
         print("[OK] 8. 打开输出目录：自动创建目录并调起系统文件管理器")
+
+        # ---------- 9. 上传素材收编：外部图 → 本地资产 uploads/ ----------
+        ext = Path(tempfile.mkdtemp(prefix="pf_up_")) / "hero.png"
+        _png(ext)
+        n_assets = win.assets_panel.lst.count()
+        win._on_basic_refs_dropped([str(ext)])
+        assert win._basic_ref_paths, "拖入后参考图列表应有内容"
+        ref0 = Path(win._basic_ref_paths[0])
+        assert ref0.parent.name == "uploads" and ref0.is_file(), \
+            f"参考图应指向收编副本: {ref0}"
+        assert ref0 != ext, "不应直接引用库外原文件"
+        win.assets_panel.refresh()
+        assert win.assets_panel.lst.count() == n_assets + 1, \
+            f"资产库应新增 1 项: {win.assets_panel.lst.count()}"
+        assert win.assets_panel._load_index()["categories"][
+            win.assets_panel._rel(ref0)] == "local", "应登记为本地资产"
+        print("[OK] 9. 上传素材收编：拖入外部图 → 本地资产 uploads/ + 参考图指向副本")
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q

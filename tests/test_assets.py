@@ -198,6 +198,36 @@ def main() -> int:
     assert panel.lst.count() == total, f"清空应复原 {total}: {panel.lst.count()}"
     print("[OK] 10. 模糊搜索: 子串/子序列/多词与/提示词命中/清空复原")
 
+    # 11. 外部素材收编：复制到 uploads/ + 登记本地资产 + MD5 去重 + 同名序号
+    ext_dir = Path(tempfile.mkdtemp(prefix="pf_ext_"))
+    ext1 = ext_dir / "my_ref.png"
+    cv2.imwrite(str(ext1), _frame((120, 40, 200)))
+    got = panel.import_external([str(ext1)], category="local")
+    p = Path(got[0])
+    assert p.parent.name == "uploads" and p.is_file(), f"应复制到 uploads/: {p}"
+    assert p.resolve() != ext1.resolve(), "应为复制副本而非原文件"
+    assert panel._load_index()["categories"][panel._rel(p)] == "local"
+    panel.refresh()
+    panel.cmb_filter.setCurrentText("本地资产")
+    assert panel.lst.count() == 2, \
+        f"本地资产应含 poster + 收编图: {panel.lst.count()}"
+    panel.cmb_filter.setCurrentText("全部")
+    got2 = panel.import_external([str(ext1)], category="local")
+    assert got2 == got, f"同内容应复用同一副本: {got2}"
+    ups = [a for a in panel._assets if a.path.parent.name == "uploads"]
+    assert len(ups) == 1, f"同内容不应重复收编: {[str(a.path) for a in ups]}"
+    ext2 = ext_dir / "my_ref.png"
+    cv2.imwrite(str(ext2), _frame((10, 200, 30)))
+    got3 = panel.import_external([str(ext2)], category="local")
+    assert Path(got3[0]) != p and Path(got3[0]).is_file()
+    assert Path(got3[0]).stem.startswith("my_ref_"), f"同名应加序号: {got3[0]}"
+    inroot = tmp / "inroot.png"
+    cv2.imwrite(str(inroot), _frame((200, 200, 10)))
+    got4 = panel.import_external([str(inroot)])
+    assert Path(got4[0]) == inroot, "库内文件应原样返回不拷贝"
+    print("[OK] 11. 外部素材收编: uploads/ 复制 + 本地资产登记 + "
+          "MD5 去重 + 同名序号 + 库内不拷贝")
+
     print("\n资产库面板测试全部通过 ✔")
     return 0
 

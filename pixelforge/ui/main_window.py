@@ -2092,7 +2092,7 @@ class MainWindow(QMainWindow):
             self.chk_gpt_oversea.setChecked(bool(rec.get("oversea")))
         refs = [p for p in (rec.get("refs") or []) if Path(p).is_file()]
         if refs:
-            self._basic_ref_paths = refs[:9]
+            self._basic_ref_paths = self._stash_local_assets(refs)[:9]
             self._refresh_basic_thumbs()
         self.chk_gpt.setChecked(rec.get("engine", "GPT") != "本地")
         if hasattr(self, "_sync_engine_buttons"):
@@ -2807,6 +2807,7 @@ class MainWindow(QMainWindow):
         files, _ = QFileDialog.getOpenFileNames(
             self, "添加骨架图（可多选，按选择顺序生成）", "",
             "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        files = self._stash_local_assets(files)   # 骨架图也收编进本地资产
         for f in files:
             self.lst_pose.addItem(f)
         if files:
@@ -2818,6 +2819,7 @@ class MainWindow(QMainWindow):
             self, "选择角色参考图（作为外观锚定）", "",
             "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
         if f:
+            f = self._stash_local_assets([f])[0]
             self.ed_ref.setText(f)
             self.log(f"参考图已设置：{Path(f).name}（生成时每帧以其为底图）")
 
@@ -3075,6 +3077,24 @@ class MainWindow(QMainWindow):
         if w is self.assets_panel:
             self.assets_panel.refresh()
 
+    def _stash_local_assets(self, paths: list) -> list[str]:
+        """把用户上传/引用的外部素材收编进「本地资产」，返回收编后的路径。
+
+        上传的参考图/骨架图不再散落在临时目录：统一复制到资产库 uploads/
+        并登记为本地资产，生成流程改用收编后的持久路径。
+        """
+        try:
+            new = self.assets_panel.import_external(paths, category="local")
+        except Exception as e:  # noqa: BLE001 收编失败不阻塞生成
+            self.log(f"⚠ 本地资产收编失败（仍按原路径使用）: {e}")
+            return [str(p) for p in paths]
+        copied = sum(1 for a, b in zip(paths, new) if Path(a) != Path(b))
+        if copied:
+            self.log(f"[本地资产] 已收编 {copied} 张上传素材 → "
+                     "资产库 / 本地资产（uploads/）")
+            self.assets_panel.refresh()
+        return new
+
     def _on_gen_material(self, paths: list, append: bool = False) -> None:
         """资产库/预览「作为生成素材」：图片进笨蛋模式参考图。
         append=False 替换现有参考图；True 追加（去重，上限 9 张）。"""
@@ -3082,6 +3102,7 @@ class MainWindow(QMainWindow):
         if not valid:
             self.log("生成素材：没有有效图片")
             return
+        valid = self._stash_local_assets(valid)
         if append:
             merged = list(self._basic_ref_paths)
             for f in valid:
@@ -3136,7 +3157,9 @@ class MainWindow(QMainWindow):
         self.log(msg)
 
     def _on_basic_refs_dropped(self, files: list) -> None:
-        """拖入图片 → 追加到参考图列表（去重，上限 9 张）。"""
+        """拖入图片 → 收编进本地资产后追加到参考图（去重，上限 9 张）。"""
+        files = self._stash_local_assets(
+            [f for f in files if Path(f).is_file()])
         added = 0
         for f in files:
             if f in self._basic_ref_paths:
@@ -3152,13 +3175,14 @@ class MainWindow(QMainWindow):
                      f"当前 {len(self._basic_ref_paths)} 张")
 
     def _upload_basic_refs(self) -> None:
-        """笨蛋模式：多选参考图 → 独立缩略图卡片 + 存列表。"""
+        """笨蛋模式：多选参考图 → 收编进本地资产 + 独立缩略图卡片。"""
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择角色图片（可多选）", "",
             "图片 (*.png *.jpg *.jpeg *.webp)")
         if not files:
             return
-        self._basic_ref_paths = [f for f in files if Path(f).is_file()]
+        self._basic_ref_paths = self._stash_local_assets(
+            [f for f in files if Path(f).is_file()])
         self._refresh_basic_thumbs()
         self.log(f"[笨蛋模式] 已上传 {len(self._basic_ref_paths)} 张参考图")
 

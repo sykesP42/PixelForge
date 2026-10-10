@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 CAT_NAMES = {"local": "本地资产", "cloud": "云资产", "generated": "生成资产"}
+UPLOAD_DIR = "uploads"          # 用户上传素材在资产根下的存放子目录
 
 
 def _to_pixmap(arr: np.ndarray) -> QPixmap:
@@ -58,6 +59,8 @@ class AssetItem:
 
 class AssetLibraryPanel(QWidget):
     state_changed = Signal(str)
+
+    IMAGE_EXTS = (".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp")
     frames_to_review = Signal(list, dict)   # [Path], atlas -> 审核区
     frames_to_player = Signal(list)         # [BGRA ndarray] -> 播放器
     image_to_lab = Signal(Path)             # 单图 -> 工具坊
@@ -173,7 +176,7 @@ class AssetLibraryPanel(QWidget):
     # ---------- 扫描 ----------
 
     def refresh(self) -> None:
-        """重扫 outputs/：动画目录（含 atlas.json）+ 顶层 PNG/GIF。"""
+        """重扫资产根：动画目录 + 顶层图片 + uploads/ 用户上传素材。"""
         root = self._scan_root()
         root.mkdir(parents=True, exist_ok=True)
         self._assets = []
@@ -194,8 +197,15 @@ class AssetLibraryPanel(QWidget):
                 self._assets.append(AssetItem(d, "anim", pngs, atlas))
         for f in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime,
                         reverse=True):
-            if f.is_file() and f.suffix.lower() in (".png", ".gif", ".jpg", ".webp"):
+            if f.is_file() and f.suffix.lower() in self.IMAGE_EXTS:
                 self._assets.append(AssetItem(f, "image"))
+        # uploads/：用户上传素材（收编进本地资产）
+        up = root / UPLOAD_DIR
+        if up.is_dir():
+            for f in sorted(up.iterdir(), key=lambda p: p.stat().st_mtime,
+                            reverse=True):
+                if f.is_file() and f.suffix.lower() in self.IMAGE_EXTS:
+                    self._assets.append(AssetItem(f, "image"))
         self._rebuild_folder_combo()
         self._apply_filter()
         self.state_changed.emit(f"资产库：扫描到 {len(self._assets)} 项（{root.name}/）")
@@ -461,6 +471,63 @@ class AssetLibraryPanel(QWidget):
             rel = self._rel(Path(p))
             idx["prompts"][rel] = info
         self._save_index(idx)
+
+    def import_external(self, paths, category: str = "local",
+                        subdir: str = UPLOAD_DIR) -> list[str]:
+        """把外部素材收编进资产库（主界面上传素材时调用）。
+
+        - 库外文件：复制到 <扫描根>/<subdir>/（同名自动加序号），并登记分类
+        - 内容相同（MD5 一致）的文件不重复收编，直接复用已有副本
+        - 已在扫描根内的文件：原路径返回，不重复拷贝、不改分类
+
+        返回与输入等长的收编后绝对路径列表（供生成流程直接引用）。
+        """
+        import hashlib
+        root = self._scan_root().resolve()
+        out: list[str] = []
+        idx: dict | None = None
+        changed = False
+        for p in paths:
+            p = Path(p)
+            if not p.is_file():
+                out.append(str(p))
+                continue
+            try:
+                p.resolve().relative_to(root)
+                out.append(str(p))            # 已在库内
+                continue
+            except ValueError:
+                pass
+            if idx is None:
+                idx = self._load_index()
+            dest_dir = root / subdir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.md5(p.read_bytes()).hexdigest()
+            dest = None
+            for f in dest_dir.iterdir():      # 同内容复用，避免重复堆积
+                if not f.is_file() or f.suffix.lower() not in self.IMAGE_EXTS:
+                    continue
+                try:
+                    if hashlib.md5(f.read_bytes()).hexdigest() == digest:
+                        dest = f
+                        break
+                except OSError:
+                    continue
+            if dest is None:
+                dest = dest_dir / p.name
+                i = 1
+                while dest.exists():
+                    dest = dest_dir / f"{p.stem}_{i}{p.suffix}"
+                    i += 1
+                shutil.copy2(p, dest)
+            rel = self._rel(dest)
+            if idx["categories"].get(rel) != category:
+                idx["categories"][rel] = category
+                changed = True
+            out.append(str(dest))
+        if changed and idx is not None:
+            self._save_index(idx)
+        return out
 
     def _import_prompt(self) -> None:
         sel = self._first_selected()
