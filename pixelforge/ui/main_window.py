@@ -22,7 +22,8 @@ from PySide6.QtGui import (
     QCursor, QImage, QKeySequence, QPainter, QPixmap, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QApplication, QComboBox, QDialog, QDockWidget, QDoubleSpinBox,
+    QAbstractItemView, QCheckBox, QApplication, QComboBox, QDialog,
+    QDockWidget, QDoubleSpinBox,
     QFileDialog,
     QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
@@ -2146,10 +2147,16 @@ class MainWindow(QMainWindow):
         it = self.lst_queue.itemAt(pos)
         if it is None:
             return
-        self.lst_queue.setCurrentItem(it)
+        if it not in self.lst_queue.selectedItems():
+            self.lst_queue.setCurrentItem(it)   # 保留多选状态
         rec = self._queue_record_of(it) or {}
         n_res = len(rec.get("results") or [])
         menu = QMenu(self)
+        sel = self.lst_queue.selectedItems()
+        act_cmp = None
+        if len(sel) == 2:
+            act_cmp = menu.addAction("⚖ 并排对比两条任务（A/B）")
+            menu.addSeparator()
         act_load = menu.addAction("📥 载入该任务设置（复用修改）")
         act_retry = menu.addAction("↻ 重跑该任务（复用相同设置立即生成）")
         act_prompt = menu.addAction("📋 导入该图提示词")
@@ -2161,7 +2168,11 @@ class MainWindow(QMainWindow):
         act_del = menu.addAction("🗑 从队列移除（保留文件）")
         act_purge = menu.addAction(f"☠ 永久删除（{n_res} 个产物文件）")
         chosen = menu.exec(self.lst_queue.mapToGlobal(pos))
-        if chosen == act_load:
+        if chosen is None:
+            return
+        if act_cmp is not None and chosen == act_cmp:
+            self._queue_compare(sel)
+        elif chosen == act_load:
             self._queue_load_settings()
         elif chosen == act_retry:
             self._queue_retry(rec)
@@ -2177,6 +2188,49 @@ class MainWindow(QMainWindow):
             self._queue_delete(it, purge=False)
         elif chosen == act_purge:
             self._queue_delete(it, purge=True)
+
+    def _queue_compare(self, items: list) -> None:
+        """⚖ 历史任务对比：队列两条选中任务的产物并排 A/B。"""
+        recs = [self._queue_record_of(it) or {} for it in items]
+        paths = []
+        for r in recs:
+            found = next((p for p in (r.get("results") or [])
+                          if Path(p).is_file()), None)
+            paths.append(found)
+        missing = [i + 1 for i, p in enumerate(paths) if p is None]
+        if len(missing) == 2:
+            self.log("两条任务都没有产物文件，无法对比")
+            return
+        if missing:
+            self.log(f"第 {missing[0]} 条任务没有产物文件，无法对比")
+            return
+        import cv2
+        import numpy as np
+        arrs = []
+        for p in paths:
+            im = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8),
+                              cv2.IMREAD_UNCHANGED)
+            if im is None:
+                self.log(f"无法读取产物图: {p}")
+                return
+            if im.ndim == 2:
+                im = cv2.cvtColor(im, cv2.COLOR_GRAY2BGRA)
+            elif im.shape[2] == 3:
+                im = cv2.cvtColor(im, cv2.COLOR_BGR2BGRA)
+            arrs.append(im)
+
+        def _lbl(idx: int) -> str:
+            r = recs[idx] or {}
+            t = (r.get("time") or "").strip()
+            pr = (r.get("prompt") or "").strip().replace("\n", " ")[:18]
+            return f"{'A' if idx == 0 else 'B'}  {t} {pr}".strip()
+
+        from pixelforge.ui.image_lab import open_ab_compare_images
+        dlg = open_ab_compare_images(
+            self, arrs[0], arrs[1],
+            title="历史任务对比 —— 队列选中 2 条",
+            label_a=_lbl(0), label_b=_lbl(1))
+        dlg.exec()
 
     def _queue_retry(self, rec: dict) -> None:
         """↻ 重跑：载入该任务设置后，用完全相同参数立即重新提交生成。"""
@@ -2375,6 +2429,7 @@ class MainWindow(QMainWindow):
         lay_log.addLayout(row_qf)
         self.lst_queue = QListWidget()
         self.lst_queue.setObjectName("queueList")
+        self.lst_queue.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.lst_queue.setContextMenuPolicy(Qt.CustomContextMenu)
         self.lst_queue.customContextMenuRequested.connect(self._queue_menu)
         self.lst_queue.itemDoubleClicked.connect(

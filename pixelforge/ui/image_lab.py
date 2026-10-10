@@ -76,10 +76,13 @@ class _ABCompare(QWidget):
     双击画面复位到 50%；鼠标移动时光标提示可拖动。
     """
 
-    def __init__(self, a: np.ndarray, b: np.ndarray, parent=None):
+    def __init__(self, a: np.ndarray, b: np.ndarray, parent=None,
+                 label_a: str = "A 基准（原图）", label_b: str = "B 当前"):
         super().__init__(parent)
         self._pa = _to_pixmap(_norm_bgra(a))
         self._pb = _to_pixmap(_norm_bgra(b))
+        self._la = label_a
+        self._lb = label_b
         self._ratio = 0.5
         self._drag = False
         self.setMinimumSize(600, 480)
@@ -121,10 +124,9 @@ class _ABCompare(QWidget):
         p.drawEllipse(QPoint(split, y + h // 2), 7, 7)
         # 角标
         p.setPen(QColor(220, 224, 230))
-        p.drawText(QRect(x, y + h + 4, w // 2, 22), Qt.AlignLeft,
-                   "A 基准（原图）")
+        p.drawText(QRect(x, y + h + 4, w // 2, 22), Qt.AlignLeft, self._la)
         p.drawText(QRect(x + w // 2, y + h + 4, w // 2, 22), Qt.AlignRight,
-                   "B 当前")
+                   self._lb)
         p.end()
 
     def _set_ratio(self, px: float) -> None:
@@ -149,6 +151,41 @@ class _ABCompare(QWidget):
     def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:  # noqa: N802
         self._ratio = 0.5
         self.update()
+
+
+def open_ab_compare_images(parent, a: np.ndarray, b: np.ndarray,
+                           title: str = "A/B 对比",
+                           label_a: str = "A 基准（原图）",
+                           label_b: str = "B 当前",
+                           note: str = "") -> QDialog:
+    """通用 A/B 对比弹窗（模块级，供队列历史任务对比等复用）。
+
+    A/B 尺寸不同时把 B 就近缩放到 A 尺寸，保证分割对比对齐。
+    """
+    note2 = note
+    if a.shape[:2] != b.shape[:2]:
+        b = cv2.resize(b, (a.shape[1], a.shape[0]),
+                       interpolation=cv2.INTER_NEAREST)
+        note2 = (note + " " if note else "") + "（尺寸不同：B 已就近缩放到 A 尺寸）"
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.resize(860, 680)
+    lay = QVBoxLayout(dlg)
+    view = _ABCompare(a, b, label_a=label_a, label_b=label_b)
+    lay.addWidget(view, 1)
+    tip = QLabel("拖动中间黄色分割线自由对比｜双击画面复位 50%｜Esc 关闭　"
+                 + note2)
+    tip.setStyleSheet("color:#8a8f98; font-size:11px;")
+    tip.setWordWrap(True)
+    lay.addWidget(tip)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    b_close = QPushButton("关闭")
+    b_close.setProperty("accent", True)
+    b_close.clicked.connect(dlg.accept)
+    row.addWidget(b_close)
+    lay.addLayout(row)
+    return dlg
 
 
 def _checker_bg(bgra: np.ndarray, cell: int = 8) -> np.ndarray:
@@ -1645,40 +1682,15 @@ class ImageLab(QWidget):
         self.state_changed.emit(f"waifu2x 失败：{msg}")
 
     def _open_ab_compare(self) -> None:
-        """⇋ A/B 对比：左=打开时的原图(A)，右=当前结果(B)，中缝可拖动。
-
-        A/B 尺寸不同时把 B 就近缩放到 A 尺寸，保证分割对比对齐。
-        """
+        """⇋ A/B 对比：左=打开时的原图(A)，右=当前结果(B)，中缝可拖动。"""
         a = self._orig
         b = self._preview if self._preview is not None else self.arr
         if a is None or b is None:
             self.state_changed.emit("A/B 对比：请先打开一张图片")
             return
-        note = ""
-        if a.shape[:2] != b.shape[:2]:
-            b = cv2.resize(b, (a.shape[1], a.shape[0]),
-                           interpolation=cv2.INTER_NEAREST)
-            note = "（尺寸不同：B 已就近缩放到 A 尺寸）"
-        dlg = QDialog(self)
-        dlg.setWindowTitle("A/B 对比 —— 左：原图(A)  右：当前(B)")
-        dlg.resize(860, 680)
-        lay = QVBoxLayout(dlg)
-        view = _ABCompare(a, b)
-        lay.addWidget(view, 1)
-        tip = QLabel("拖动中间黄色分割线自由对比｜双击画面复位 50%｜Esc 关闭　"
-                     + note)
-        tip.setStyleSheet("color:#8a8f98; font-size:11px;")
-        tip.setWordWrap(True)
-        lay.addWidget(tip)
-        row = QHBoxLayout()
-        row.addStretch(1)
-        b_close = QPushButton("关闭")
-        b_close.setProperty("accent", True)
-        b_close.clicked.connect(dlg.accept)
-        row.addWidget(b_close)
-        lay.addLayout(row)
         self.state_changed.emit("A/B 对比：拖动分割线比对原图与当前结果")
-        dlg.exec()
+        open_ab_compare_images(
+            self, a, b, title="A/B 对比 —— 左：原图(A)  右：当前(B)").exec()
 
     def _render(self, arr: np.ndarray | None = None) -> None:
         a = arr if arr is not None else (

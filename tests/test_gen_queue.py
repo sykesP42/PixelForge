@@ -239,6 +239,42 @@ def main() -> int:
             QDialog.exec = orig_exec
             win._skip_gen_confirm = False
         print("[OK] 10. 生成前参数摘要确认：GPT/本地行齐全 + 取消拦截 + 不再提示生效")
+
+        # ---------- 11. 历史任务并排对比（A/B 复用） ----------
+        from PySide6.QtWidgets import QDialog
+        ra = tmp / "cmp_a.png"
+        rb = tmp / "cmp_b.png"
+        cv2.imwrite(str(ra), np.full((12, 16, 4), (30, 60, 200, 255), np.uint8))
+        cv2.imwrite(str(rb), np.full((12, 16, 4), (200, 120, 30, 255), np.uint8))
+        for rid, p in (("a1", ra), ("a2", rb)):
+            cfgmod.upsert_queue_record({"id": rid, "results": [str(p)]})
+        want = {"a1": None, "a2": None}
+        for i in range(win.lst_queue.count()):
+            it = win.lst_queue.item(i)
+            tid = it.data(Qt.UserRole + 2)
+            if tid in want:
+                want[tid] = it
+        assert all(want.values()), f"应能定位两条队列项: {want}"
+        cap = {}
+        orig_exec = QDialog.exec
+        QDialog.exec = lambda self: (cap.setdefault("dlg", self), 0)[1]
+        try:
+            win._queue_compare([want["a1"], want["a2"]])
+        finally:
+            QDialog.exec = orig_exec
+        dlg = cap.get("dlg")
+        assert dlg is not None, "应弹出对比对话框"
+        assert "历史任务对比" in dlg.windowTitle(), dlg.windowTitle()
+        # 无产物 → 不弹窗
+        cfgmod.upsert_queue_record({"id": "a1", "results": []})
+        cap.clear()
+        QDialog.exec = lambda self: (cap.setdefault("dlg", self), 0)[1]
+        try:
+            win._queue_compare([want["a1"], want["a2"]])
+        finally:
+            QDialog.exec = orig_exec
+        assert cap.get("dlg") is None, "缺产物时应拦截不弹窗"
+        print("[OK] 11. 历史任务对比：两条选中产物 A/B 并排 + 缺产物拦截")
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q
