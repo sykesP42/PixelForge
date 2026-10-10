@@ -1,7 +1,8 @@
 """动画播放工作区：裁切帧的循环预览，带基本播放设置。
 
 播放设置：播放/暂停/停止、FPS（1-60，播放中可调）、方向（正放/倒放/往返）、
-循环开关、缩放（适配/1x/2x/4x）、背景（深灰/黑/白/棋盘格）、帧条逐帧浏览。
+循环开关、缩放（适配/1x/2x/4x）、背景（深灰/黑/白/棋盘格）、帧条逐帧浏览、
+洋葱皮（前红/后蓝半透明残影叠加，前后各 N 帧）。
 数据源：工具坊"发送到动画播放器"，或"打开帧目录"（按文件名排序的 PNG）。
 """
 from __future__ import annotations
@@ -15,8 +16,8 @@ from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QPushButton, QSlider, QVBoxLayout,
-    QWidget,
+    QListWidgetItem, QMenu, QMessageBox, QPushButton, QSlider, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 from pixelforge.processing.aseprite_io import export_aseprite, frames_by_tag
@@ -109,6 +110,19 @@ class AnimPlayer(QWidget):
         self.chk_tween.setToolTip("导出时在相邻帧之间插入 50% 混合过渡帧（ghost frame），\n"
                                   "序列长度近似翻倍，播放更顺滑")
         bar2.addWidget(self.chk_tween)
+        self.chk_onion = QCheckBox("洋葱皮")
+        self.chk_onion.setToolTip(
+            "叠加显示当前帧前(红)/后(蓝)若干帧的半透明残影，便于检查动作连贯与对位")
+        self.chk_onion.toggled.connect(lambda _: self._render())
+        bar2.addWidget(self.chk_onion)
+        self.spin_onion = QSpinBox()
+        self.spin_onion.setRange(1, 4)
+        self.spin_onion.setValue(1)
+        self.spin_onion.setToolTip("洋葱皮范围：前后各叠加 N 帧")
+        self.spin_onion.setEnabled(False)
+        self.spin_onion.valueChanged.connect(lambda _: self._render())
+        self.chk_onion.toggled.connect(self.spin_onion.setEnabled)
+        bar2.addWidget(self.spin_onion)
         self.lbl_frame = QLabel("0 / 0")
         bar2.addWidget(self.lbl_frame)
         bar2.addWidget(QLabel("动画组"))
@@ -369,11 +383,46 @@ class AnimPlayer(QWidget):
         return (a[:, :, :3].astype(np.float32) * af
                 + bg.astype(np.float32) * (1 - af)).astype(np.uint8)
 
+    def _onion_frame(self, cur: np.ndarray) -> np.ndarray:
+        """洋葱皮：把当前帧前(红)/后(蓝)各 N 帧以半透明残影垫在底层。
+
+        返回合成后的 BGRA 帧，再交给 _composite 处理背景，保证各背景模式一致。
+        """
+        n = len(self._frames)
+        rng = self.spin_onion.value() if hasattr(self, "spin_onion") else 1
+        h, w = cur.shape[:2]
+        out = np.zeros((h, w, 4), np.float32)
+        # 由远及近铺设残影（远的先画，近的后画覆盖在上）
+        for off in range(rng, 0, -1):
+            for delta, tint in ((-off, (0, 80, 255)), (off, (255, 120, 0))):
+                j = self._pos + delta
+                if not (0 <= j < n):
+                    continue
+                fr = self._frames[j]
+                if fr.shape[:2] != (h, w):
+                    fr = cv2.resize(fr, (w, h), interpolation=cv2.INTER_NEAREST)
+                al = fr[:, :, 3:4].astype(np.float32) / 255.0 * (0.35 / off)
+                rgb = (fr[:, :, :3].astype(np.float32) * 0.5
+                       + np.array(tint, np.float32) * 0.5)
+                a1 = al[:, :, 0]
+                out[:, :, :3] = rgb * al + out[:, :, :3] * (1 - al)
+                out[:, :, 3] = np.clip(a1 * 255 + out[:, :, 3] * (1 - a1),
+                                       0, 255)
+        # 当前帧置顶（不透明部分盖住残影）
+        ca = cur[:, :, 3:4].astype(np.float32) / 255.0
+        c1 = ca[:, :, 0]
+        out[:, :, :3] = cur[:, :, :3].astype(np.float32) * ca + out[:, :, :3] * (1 - ca)
+        out[:, :, 3] = np.clip(c1 * 255 + out[:, :, 3] * (1 - c1), 0, 255)
+        return out.astype(np.uint8)
+
     def _render(self) -> None:
         if not self._frames:
             return
         self._pos = min(max(self._pos, 0), len(self._frames) - 1)
         a = self._frames[self._pos]
+        if (hasattr(self, "chk_onion") and self.chk_onion.isChecked()
+                and len(self._frames) > 1):
+            a = self._onion_frame(a)
         h, w = a.shape[:2]
         pm = _to_pixmap(self._composite(a))
 

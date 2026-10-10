@@ -157,6 +157,38 @@ def main() -> int:
     assert gif.is_file() and gif.stat().st_size > 0
     print("[OK] 导出 GIF 动图")
 
+    # 15. 洋葱皮：前后帧残影叠加（前红/后蓝），范围可调
+    p.stop()
+    p._pos = 1
+    base = p._frames[1]
+    p.chk_onion.setChecked(False)
+    assert not p.spin_onion.isEnabled(), "未勾选时范围微调应禁用"
+    p._render()
+    assert p.canvas.pixmap() is not None
+    p.chk_onion.setChecked(True)
+    assert p.spin_onion.isEnabled(), "勾选洋葱皮后范围微调应启用"
+    on = p._onion_frame(base)
+    assert on.shape == base.shape and on.dtype == np.uint8, "合成应保持 BGRA 尺寸"
+    assert not np.array_equal(on, base), "洋葱皮合成结果应与原帧不同"
+    p._render()
+    assert p.canvas.pixmap() is not None
+    # 范围可调：5 帧动画下 rng=2 比 rng=1 多纳入更远帧 -> 结果不同
+    p.set_frames([p._frames[i % 3] for i in range(5)], name="onion5")
+    p._pos = 2
+    p.chk_onion.setChecked(True)
+    p.spin_onion.setValue(1)
+    r1 = p._onion_frame(p._frames[2])
+    p.spin_onion.setValue(2)
+    r2 = p._onion_frame(p._frames[2])
+    assert not np.array_equal(r1, r2), "范围变化应影响残影强度/层数"
+    p.spin_onion.setValue(1)
+    # 首帧：无前帧，仅后帧残影，仍可正常渲染
+    p._pos = 0
+    p._render()
+    assert p.canvas.pixmap() is not None
+    p.chk_onion.setChecked(False)
+    print("[OK] 洋葱皮: 前红/后蓝残影叠加，范围可调，边界帧安全")
+
     print("\n动画播放器全部测试通过 ✔")
     return 0
 
