@@ -18,7 +18,9 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCursor, QImage, QPainter, QPixmap
+from PySide6.QtGui import (
+    QCursor, QImage, QKeySequence, QPainter, QPixmap, QShortcut,
+)
 from PySide6.QtWidgets import (
     QCheckBox, QApplication, QComboBox, QDialog, QDockWidget, QDoubleSpinBox,
     QFileDialog,
@@ -811,7 +813,103 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.lbl_conn)
         self.statusBar().addPermanentWidget(self.lbl_gpu)  # 显卡信息固定右侧
         self.statusBar().addPermanentWidget(self.lbl_tab_tips)
+        self._install_shortcuts()        # 全局快捷键（F1 一览表同源）
         self._on_tab_changed(self.tabs.currentIndex())   # 初始模块提示
+
+    # ---- 快捷键（单一数据源：面板展示与实际绑定同源） ----
+
+    # (分组, 按键, 说明)；keys 为空 = 仅供展示（由控件内部处理）
+    SHORTCUT_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+        ("生成", [
+            ("Ctrl+G", "开始生成（当前模式与参数）"),
+            ("Ctrl+Shift+S", "停止队列中选中的任务"),
+            ("Ctrl+Shift+O", "打开产物输出目录"),
+        ]),
+        ("界面", [
+            ("F1", "打开本快捷键一览"),
+            ("Ctrl+,", "打开设置对话框"),
+            ("Ctrl+1 / 2 / 3", "切换 笨蛋 / 专注 / 专业 模式"),
+            ("Ctrl+R", "刷新资产库"),
+        ]),
+        ("生成与审核 · 看图器", [
+            ("滚轮", "缩放画布（放大镜开启时改为调倍率 2x~20x）"),
+            ("左键拖拽", "平移画面"),
+            ("双击 / F", "适配窗口"),
+            ("1", "1:1 原始比例"),
+            ("M", "切换放大镜"),
+            ("按住 Alt", "临时放大镜（松开还原）"),
+        ]),
+        ("动画播放", [
+            ("Ctrl+P", "播放 / 暂停"),
+        ]),
+        ("动画播放 · 洋葱皮", [
+            ("勾选「洋葱皮」", "叠加前(红)/后(蓝)若干帧半透明残影，右侧微调前后帧数"),
+        ]),
+        ("资产库", [
+            ("双击", "在预览中打开该资产"),
+            ("右键", "重载 / 作为生成素材 / 收藏 / 分类"),
+            ("框选拖拽", "多选（收藏、上云、移动文件夹）"),
+        ]),
+        ("队列日志", [
+            ("双击", "载入该任务设置用于复用修改"),
+            ("右键", "载入 / 重跑 / 导入提示词 / 预览 / 删除"),
+            ("悬停", "浮窗预览参考图 + 产物 + 提示词"),
+        ]),
+    ]
+
+    def _install_shortcuts(self) -> None:
+        """注册全局快捷键。与 SHORTCUT_GROUPS 中标注的按键保持一致。"""
+        def bind(seq: str, slot) -> None:
+            sc = QShortcut(QKeySequence(seq), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)   # 保持引用防回收
+
+        self._shortcuts: list[QShortcut] = []
+        bind("F1", self._show_shortcuts)
+        bind("Ctrl+,", self._open_settings_dialog)
+        bind("Ctrl+G", self.on_generate)
+        bind("Ctrl+Shift+S", self._stop_selected_task)
+        bind("Ctrl+Shift+O", self._open_output_dir)
+        bind("Ctrl+R", lambda: self.assets_panel.refresh())
+        bind("Ctrl+P", lambda: self.anim_player.toggle_play())
+        for i in range(3):
+            bind(f"Ctrl+{i + 1}",
+                 lambda idx=i: self.cmb_ui_mode.setCurrentIndex(idx))
+
+    def _show_shortcuts(self) -> None:
+        """F1：快捷键一览（按分组渲染，深浅主题自适应）。"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("快捷键一览")
+        dlg.resize(560, 620)
+        lay = QVBoxLayout(dlg)
+        box = QLabel()
+        box.setTextFormat(Qt.RichText)
+        box.setWordWrap(True)
+        box.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        rows = []
+        for group, items in self.SHORTCUT_GROUPS:
+            rows.append(
+                f'<p style="margin:10px 0 4px 0;"><b>{group}</b></p>'
+                '<table cellspacing="0" cellpadding="4" width="100%">')
+            for keys, desc in items:
+                rows.append(
+                    f'<tr><td width="150"><b>{keys}</b></td>'
+                    f'<td>{desc}</td></tr>')
+            rows.append("</table>")
+        box.setText("".join(rows))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(box)
+        lay.addWidget(scroll, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b = QPushButton("关闭")
+        b.setProperty("accent", True)
+        b.clicked.connect(dlg.accept)
+        row.addWidget(b)
+        lay.addLayout(row)
+        dlg.exec()
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
@@ -1119,6 +1217,11 @@ class MainWindow(QMainWindow):
         self.btn_open_out.setFixedHeight(26)
         self.btn_open_out.clicked.connect(self._open_output_dir)
         cl.addWidget(self.btn_open_out)
+        self.btn_shortcuts = QPushButton("⌨ 快捷键")
+        self.btn_shortcuts.setToolTip("快捷键一览（F1）")
+        self.btn_shortcuts.setFixedHeight(26)
+        self.btn_shortcuts.clicked.connect(self._show_shortcuts)
+        cl.addWidget(self.btn_shortcuts)
         self.btn_settings_top = QPushButton("⚙ 设置")
         self.btn_settings_top.setToolTip("引擎 / API 密钥 / 高级生成 / 通用")
         self.btn_settings_top.setFixedHeight(26)
