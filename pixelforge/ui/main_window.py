@@ -1017,16 +1017,33 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentWidget(self.anim_player)
             done.append(f"{d.name}/（{len(self.anim_player._frames)} 帧）")
         if imgs:
-            if len(imgs) == 1:
-                self.viewer.set_image(str(imgs[0]))
-                self.tabs.setCurrentIndex(0)
-                done.append(imgs[0].name)
-            else:
-                files = sorted(imgs)
-                self.anim_player.set_frames(list(files),
-                                            name=files[0].stem or "dropped")
-                self.tabs.setCurrentWidget(self.anim_player)
-                done.append(f"{len(files)} 张图片 → 动画帧")
+            gifs = [p for p in imgs if p.suffix.lower() in (".gif", ".apng")]
+            static = [p for p in imgs if p not in gifs]
+            if gifs:   # 动图 → 拆帧进动画播放器
+                from pixelforge.processing.editing import load_gif_frames
+                for g in gifs:
+                    try:
+                        frames = load_gif_frames(g)
+                    except Exception as ex:  # noqa: BLE001
+                        self.log(f"⚠ 动图读取失败（{g.name}）：{ex}")
+                        continue
+                    if not frames:
+                        self.log(f"⚠ {g.name} 中没有帧，已忽略")
+                        continue
+                    self.anim_player.set_frames(frames, name=g.stem)
+                    self.tabs.setCurrentWidget(self.anim_player)
+                    done.append(f"{g.name}（{len(frames)} 帧 → 动画）")
+            if static:
+                if len(static) == 1:
+                    self.viewer.set_image(str(static[0]))
+                    self.tabs.setCurrentIndex(0)
+                    done.append(static[0].name)
+                else:
+                    files = sorted(static)
+                    self.anim_player.set_frames(
+                        files, name=files[0].stem or "dropped")
+                    self.tabs.setCurrentWidget(self.anim_player)
+                    done.append(f"{len(files)} 张图片 → 动画帧")
         if done:
             self.log("📥 已打开拖入内容：" + "；".join(done))
         else:

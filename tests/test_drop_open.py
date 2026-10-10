@@ -109,6 +109,29 @@ def main() -> int:
         assert len(win.anim_player._frames) == before, "无效拖入不应改变帧"
         print("[OK] 5. 无效 JSON / 空目录 → 安全忽略且日志提示")
 
+        # 6. 动图 GIF -> 拆帧进动画播放器
+        from PIL import Image
+        gp = tmp / "walk.gif"
+        cols = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255)]
+        frs = []
+        for c in cols:
+            im = Image.new("RGBA", (16, 16), c)
+            frs.append(im)
+        frs[0].save(gp, save_all=True, append_images=frs[1:], duration=100,
+                    loop=0)
+        _drop(win, [gp])
+        assert win.tabs.currentWidget() is win.anim_player, "GIF 应切到动画播放"
+        assert len(win.anim_player._frames) == 3, \
+            f"GIF 应拆出 3 帧: {len(win.anim_player._frames)}"
+        # GIF + 普通图混合：GIF 进动画，普通图进看图器
+        png2 = _png(tmp / "mix.png", (255, 255, 0))
+        _drop(win, [gp, png2])
+        assert len(win.anim_player._frames) == 3, "GIF 帧数应保持 3"
+        assert win.tabs.currentIndex() == 0 and \
+            Path(win.viewer.current_path()).name == "mix.png", \
+            "混合拖入时静态图应进看图器"
+        print("[OK] 6. 拖入 GIF → 拆帧动画（3 帧）+ GIF/静态图混合分流")
+
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q
