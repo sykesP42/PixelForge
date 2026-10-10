@@ -188,6 +188,52 @@ def main() -> int:
     assert editing.grid_split(blank, 2, 2) == []
     print("[OK] 空画布边界处理")
 
+    # 16. A/B 对比：弹窗（打桩 exec）+ 分割线拖动 + 尺寸对齐 + 空态提示
+    from PySide6.QtWidgets import QDialog
+    from pixelforge.ui.image_lab import _ABCompare
+
+    def _open_stub(lab):
+        cap = {}
+        orig = QDialog.exec
+        QDialog.exec = lambda self: (cap.setdefault("dlg", self), 0)[1]
+        try:
+            lab._open_ab_compare()
+        finally:
+            QDialog.exec = orig
+        return cap.get("dlg")
+
+    lab._orig = np.full((40, 60, 4), (0, 0, 200, 255), np.uint8)
+    lab.arr = np.full((40, 60, 4), (0, 200, 0, 255), np.uint8)
+    lab._preview = None
+    dlg = _open_stub(lab)
+    assert dlg is not None, "应弹出对比对话框"
+    view = dlg.findChild(_ABCompare)
+    assert view is not None and abs(view._ratio - 0.5) < 1e-6
+    view.resize(600, 480)
+    view.grab()                     # 触发 paintEvent，验证绘制不崩
+    x, y, w, h, size = view._geo()
+    assert w > 0 and h > 0, f"显示区应有效: {view._geo()}"
+    view._set_ratio(x + w * 0.25)
+    assert abs(view._ratio - 0.25) < 0.02, f"拖动后 ratio={view._ratio}"
+    view._set_ratio(x - 999)
+    assert view._ratio == 0.0, "左越界应收敛到 0"
+    view._set_ratio(x + w + 999)
+    assert view._ratio == 1.0, "右越界应收敛到 1"
+    # 尺寸不一致 -> B 就近缩放到 A，仍能正常绘制
+    lab.arr = np.full((20, 30, 4), (0, 200, 0, 255), np.uint8)
+    dlg2 = _open_stub(lab)
+    v2 = dlg2.findChild(_ABCompare)
+    assert v2 is not None
+    v2.resize(600, 480)
+    v2.grab()
+    # 未打开图片 -> 仅状态提示，不弹窗
+    lab._orig = None
+    msgs = []
+    lab.state_changed.connect(lambda m: msgs.append(m))
+    assert _open_stub(lab) is None
+    assert any("A/B" in m for m in msgs), f"应有空态提示: {msgs}"
+    print("[OK] A/B 对比: 弹窗/分割线拖动与边界收敛/尺寸对齐/空态提示")
+
     print("\n图像工具坊全部测试通过 ✔")
     return 0
 

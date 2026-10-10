@@ -4,6 +4,7 @@
 - 打开/拖拽图片，撤销（20步），重置，保存/另存为
 - 一键去背景：四角自动取色 + 容差滑块实时预览（防抖 120ms），应用/取消两段式提交
 - 画笔修边：擦除残留 / 恢复误删（笔刷大小可调，映射缩放坐标），按住查看原图
+- A/B 对比：弹出对比窗口，左=原图(A) 右=当前(B)，黄色分割线可拖动比对
 - 智能单帧：整体内容紧致化输出 1 帧（单角色图不再被网格切碎）
 - 自动裁切双模式：连通域 / 网格切分（行 x 列）
 - 自由裁切：画布叠加裁切框，拖四边微调 / 框内整体移动 / 框外拖动新建框
@@ -23,13 +24,15 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEvent, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import (
+    QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal,
+)
 from PySide6.QtGui import (
     QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QRegion,
 )
 from PySide6.QtWidgets import (
-    QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
+    QCheckBox, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout,
+    QGroupBox, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
     QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -54,6 +57,96 @@ def _to_pixmap(arr: np.ndarray) -> QPixmap:
     h, w = rgba.shape[:2]
     img = QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888)
     return QPixmap.fromImage(img.copy())
+
+
+def _norm_bgra(arr: np.ndarray) -> np.ndarray:
+    """统一为 BGRA（灰度/三通道输入自动升维）。"""
+    if arr.ndim == 2:
+        return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGRA)
+    if arr.shape[2] == 3:
+        return cv2.cvtColor(arr, cv2.COLOR_BGR2BGRA)
+    return arr
+
+
+class _ABCompare(QWidget):
+    """A/B 对比画布：左 = 基准 A（原图），右 = 当前 B，分割线可拖动。
+
+    双击画面复位到 50%；鼠标移动时光标提示可拖动。
+    """
+
+    def __init__(self, a: np.ndarray, b: np.ndarray, parent=None):
+        super().__init__(parent)
+        self._pa = _to_pixmap(_norm_bgra(a))
+        self._pb = _to_pixmap(_norm_bgra(b))
+        self._ratio = 0.5
+        self._drag = False
+        self.setMinimumSize(600, 480)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.SplitHCursor)
+
+    # 显示区几何：等比缩放居中 + 底部留出标签行
+    def _geo(self) -> tuple[int, int, int, int, QSize]:
+        r = self.rect().adjusted(10, 10, -10, -30)
+        pm = self._pb.scaled(r.size(), Qt.KeepAspectRatio,
+                             Qt.FastTransformation)
+        x = r.x() + (r.width() - pm.width()) // 2
+        y = r.y() + (r.height() - pm.height()) // 2
+        return x, y, pm.width(), pm.height(), pm.size()
+
+    def paintEvent(self, _e) -> None:  # noqa: N802 Qt 约定
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(32, 34, 37))
+        x, y, w, h, size = self._geo()
+        if w <= 0 or h <= 0:
+            p.end()
+            return
+        pa = self._pa.scaled(size, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        pb = self._pb.scaled(size, Qt.IgnoreAspectRatio, Qt.FastTransformation)
+        split = x + int(w * self._ratio)
+        p.save()
+        p.setClipRect(QRect(x, y, split - x, h))
+        p.drawPixmap(x, y, pa)
+        p.restore()
+        p.save()
+        p.setClipRect(QRect(split, y, x + w - split, h))
+        p.drawPixmap(x, y, pb)
+        p.restore()
+        # 分割线 + 手柄
+        p.setPen(QPen(QColor(255, 208, 0), 2))
+        p.drawLine(split, y, split, y + h)
+        p.setBrush(QColor(255, 208, 0))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(QPoint(split, y + h // 2), 7, 7)
+        # 角标
+        p.setPen(QColor(220, 224, 230))
+        p.drawText(QRect(x, y + h + 4, w // 2, 22), Qt.AlignLeft,
+                   "A 基准（原图）")
+        p.drawText(QRect(x + w // 2, y + h + 4, w // 2, 22), Qt.AlignRight,
+                   "B 当前")
+        p.end()
+
+    def _set_ratio(self, px: float) -> None:
+        _x, _y, w, _h, _s = self._geo()
+        if w <= 0:
+            return
+        self._ratio = min(1.0, max(0.0, (px - _x) / w))
+        self.update()
+
+    def mousePressEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        self._drag = True
+        self._set_ratio(e.position().x())
+
+    def mouseMoveEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        self.setCursor(Qt.SizeHorCursor if self._drag else Qt.SplitHCursor)
+        if self._drag:
+            self._set_ratio(e.position().x())
+
+    def mouseReleaseEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        self._drag = False
+
+    def mouseDoubleClickEvent(self, e: QMouseEvent) -> None:  # noqa: N802
+        self._ratio = 0.5
+        self.update()
 
 
 class _MacroWorker(QThread):
@@ -171,6 +264,10 @@ class ImageLab(QWidget):
         b_cmp.pressed.connect(lambda: self._render(self._orig))
         b_cmp.released.connect(lambda: self._render())
         br.addWidget(b_cmp)
+        b_ab = QPushButton("⇋ A/B 对比")
+        b_ab.setToolTip("弹出对比窗口：左=打开时的原图(A)，右=当前结果(B)，拖动中缝比对")
+        b_ab.clicked.connect(self._open_ab_compare)
+        br.addWidget(b_ab)
         tools.addWidget(g_brush)
 
         g_crop = QGroupBox("自动裁切")
@@ -1159,6 +1256,42 @@ class ImageLab(QWidget):
     def _set_zoom(self, v: float) -> None:
         self._zoom = v
         self._render()
+
+    def _open_ab_compare(self) -> None:
+        """⇋ A/B 对比：左=打开时的原图(A)，右=当前结果(B)，中缝可拖动。
+
+        A/B 尺寸不同时把 B 就近缩放到 A 尺寸，保证分割对比对齐。
+        """
+        a = self._orig
+        b = self._preview if self._preview is not None else self.arr
+        if a is None or b is None:
+            self.state_changed.emit("A/B 对比：请先打开一张图片")
+            return
+        note = ""
+        if a.shape[:2] != b.shape[:2]:
+            b = cv2.resize(b, (a.shape[1], a.shape[0]),
+                           interpolation=cv2.INTER_NEAREST)
+            note = "（尺寸不同：B 已就近缩放到 A 尺寸）"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("A/B 对比 —— 左：原图(A)  右：当前(B)")
+        dlg.resize(860, 680)
+        lay = QVBoxLayout(dlg)
+        view = _ABCompare(a, b)
+        lay.addWidget(view, 1)
+        tip = QLabel("拖动中间黄色分割线自由对比｜双击画面复位 50%｜Esc 关闭　"
+                     + note)
+        tip.setStyleSheet("color:#8a8f98; font-size:11px;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        b_close = QPushButton("关闭")
+        b_close.setProperty("accent", True)
+        b_close.clicked.connect(dlg.accept)
+        row.addWidget(b_close)
+        lay.addLayout(row)
+        self.state_changed.emit("A/B 对比：拖动分割线比对原图与当前结果")
+        dlg.exec()
 
     def _render(self, arr: np.ndarray | None = None) -> None:
         a = arr if arr is not None else (
