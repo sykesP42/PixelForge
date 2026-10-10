@@ -17,12 +17,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main() -> int:
     workflows = ROOT / "pixelforge" / "workflows"
+    models = ROOT / "pixelforge" / "models"
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
         "--windowed",
         "--name", "PixelForgeStudio",
         "--add-data", f"{workflows};pixelforge/workflows",
+        "--add-data", f"{models};pixelforge/models",
         "--distpath", str(ROOT / "dist"),
         "--workpath", str(ROOT / "build"),
         "--specpath", str(ROOT / "build"),

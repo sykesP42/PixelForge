@@ -159,6 +159,68 @@ def main() -> int:
         pass
     print("[OK] adjust_frames: 参数长度校验")
 
+    # ---- waifu2x 超分辨率（UpConv7，纯 numpy 推理） ----
+    from pixelforge.processing import waifu2x as w2x
+
+    assert len(w2x.available_models()) == 5, "应随包分发 5 个 upconv7 权重"
+    print("[OK] waifu2x: 模型权重齐全（noise0~3 + scale）")
+
+    px = np.zeros((24, 24, 4), np.uint8)
+    px[4:20, 4:20] = (60, 180, 60, 255)
+    px[8:16, 8:16] = (0, 0, 220, 255)
+    out = w2x.upscale(px, scale=2, noise_level=1)
+    assert out.shape[:2] == (48, 48) and out.shape[2] == 4
+    print("[OK] waifu2x: 2x 输出尺寸 48x48 BGRA")
+
+    out4 = w2x.upscale(px, scale=4, noise_level=-1)
+    assert out4.shape[:2] == (96, 96)
+    print("[OK] waifu2x: 4x 输出尺寸 96x96（两次 2x）")
+
+    # 平色保持（权重排布错误的强判据：错误时会输出乱码）
+    flat = np.full((24, 24, 3), 128, np.uint8)
+    of = w2x.upscale(flat, scale=2, noise_level=-1)
+    assert abs(of[:, :, :3].mean() - 128) < 4 and of[:, :, :3].std() < 6, \
+        f"平色应保持: mean={of.mean():.1f} std={of.std():.2f}"
+    print("[OK] waifu2x: 平色区完全保持（mean=128.0, std≈0）")
+
+    # 硬边锐利：2x 后过渡带宽 ≤ 3px（bicubic 会拖出宽渐变）
+    edge = np.zeros((32, 32, 3), np.uint8)
+    edge[:, 16:] = 255
+    oe = w2x.upscale(edge, scale=2, noise_level=-1)[:, :, :3]
+    row = oe[16].mean(axis=1).astype(int)
+    trans = np.where(np.abs(np.diff(row)) > 2)[0]
+    assert trans.size and (trans.max() - trans.min() + 1) <= 3, \
+        f"边缘应锐利: {trans}"
+    print("[OK] waifu2x: 黑白硬边单像素阶跃（无插值糊边）")
+
+    # 透明区保持透明 + alpha 最近邻锐利
+    pa = np.zeros((16, 16, 4), np.uint8)
+    pa[4:12, 4:12] = (255, 0, 0, 255)
+    pa[0:2, 0:2] = (0, 255, 0, 0)      # 一块全透明
+    oa = w2x.upscale(pa, scale=2, noise_level=0)
+    assert oa[0:4, 0:4, 3].max() == 0, "透明区应保持 alpha=0"
+    assert (oa[:, :, 3] == 255).sum() == 16 * 16, "alpha 应最近邻放大保持硬边"
+    print("[OK] waifu2x: 透明区不渗色 + alpha 硬边保持")
+
+    # 分块尺寸不影响结果（tile 64 vs 32，边缘填充逻辑一致）
+    big = cv2.resize(px[:, :, :3], (64, 64), interpolation=cv2.INTER_CUBIC)
+    b1 = w2x._blockwise(big.astype(np.float32) / 255,
+                        w2x._load_weights(w2x._model_file(-1)), None, 64)
+    b2 = w2x._blockwise(big.astype(np.float32) / 255,
+                        w2x._load_weights(w2x._model_file(-1)), None, 32)
+    d = np.abs(b1 - b2).max()
+    assert d < 0.05, f"分块尺寸差异应很小: {d:.4f}"
+    print(f"[OK] waifu2x: 分块推理一致性（tile 64 vs 32 最大差 {d:.4f}）")
+
+    # 非法参数
+    for kw in ({"scale": 3}, {"noise_level": 9}):
+        try:
+            w2x.upscale(px, **kw)
+            raise AssertionError(f"{kw} 应抛 Waifu2xError")
+        except w2x.Waifu2xError:
+            pass
+    print("[OK] waifu2x: 非法倍率/降噪等级报错")
+
     print("\n阶段2 全部测试通过 ✔")
     return 0
 

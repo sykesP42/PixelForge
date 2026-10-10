@@ -100,6 +100,37 @@ def main() -> int:
     assert hasattr(v, "lbl_tips") and "Alt" in v.lbl_tips.text()
     print("[OK] 6. Alt 按住临时放大镜 + 滚轮倍率 + 底部提示行")
 
+    # 7. waifu2x：同步跑完（打桩 start）→ 自动打开结果图 + 进度/错误走日志
+    from pixelforge.ui.w2x_worker import Waifu2xWorker
+    small = tmp / "tiny.png"
+    cv2.imwrite(str(small), np.full((12, 12, 4), (90, 120, 60, 255), np.uint8))
+    v.set_image(str(small))
+    msgs = []
+    v.state_message.connect(msgs.append)
+    orig_start = Waifu2xWorker.start
+    Waifu2xWorker.start = lambda self: self.run()
+    try:
+        v.btn_w2x.click()
+    finally:
+        Waifu2xWorker.start = orig_start
+    out_path = tmp / "tiny_waifu2x2x.png"
+    assert out_path.is_file(), f"结果应写盘: {out_path}"
+    assert v.current_path() == str(out_path), "完成后应自动打开结果图"
+    assert v.image_size() == (24, 24), f"应为 2x: {v.image_size()}"
+    assert any("waifu2x 完成" in m for m in msgs), f"应有完成日志: {msgs}"
+    assert v.btn_w2x.isEnabled() and v.btn_w2x.text().endswith("waifu2x"), \
+        "按钮应恢复"
+    print("[OK] 7. waifu2x: 看图器一键放大（写盘+自动打开+日志）")
+
+    # 8. 过大图守卫（不发推理，直接拒绝）
+    big = np.zeros((1500, 1400, 4), np.uint8)          # 210 万像素 > 200 万
+    wk = Waifu2xWorker(big, scale=2, noise_level=-1)
+    errs = []
+    wk.failed.connect(errs.append)
+    wk.run()
+    assert errs and "图片过大" in errs[0], f"应拒绝过大图: {errs}"
+    print("[OK] 8. waifu2x: 超过 200 万像素守卫生效")
+
     print("\n看图器测试全部通过 ✔")
     return 0
 

@@ -1871,6 +1871,7 @@ class MainWindow(QMainWindow):
         """简化：专业看图器 + 两个按钮（审核区改为隐藏承载，功能不删）。"""
         from pixelforge.ui.image_viewer import ProImageViewer
         self.viewer = ProImageViewer()
+        self.viewer.state_message.connect(self.log)   # waifu2x 进度/错误进日志
 
         # 审核区改为隐藏承载：资产重载/后处理照常喂数据，不再占中央面板
         self.review = ReviewWidget()

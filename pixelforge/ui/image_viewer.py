@@ -12,14 +12,16 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QColor, QImage, QPainter, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
-    QLabel, QPushButton, QVBoxLayout, QWidget,
+    QComboBox, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView,
+    QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
+
+from pixelforge.ui.w2x_worker import Waifu2xWorker
 
 ZOOM_MIN = 0.08
 ZOOM_MAX = 40.0
@@ -91,6 +93,8 @@ class _Minimap(QWidget):
 class ProImageViewer(QWidget):
     """看图器主体：QGraphicsView + loupe 覆盖层 + minimap。"""
 
+    state_message = Signal(str)     # 处理进度/错误回传主窗口日志
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._path: str | None = None
@@ -100,6 +104,7 @@ class ProImageViewer(QWidget):
         self.loupe_zoom = 4          # 放大镜倍率（滚轮在放大镜模式下调节）
         self._mouse_pos = QPointF(-1, -1)
         self._mouse_inside = False
+        self._w2x_worker = None      # waifu2x 后台线程
 
         self.view = _View(self)
         self.scene = QGraphicsScene(self)
@@ -125,6 +130,20 @@ class ProImageViewer(QWidget):
         self.btn_1to1 = QPushButton("1:1")
         self.btn_1to1.setFixedHeight(24)
         self.btn_1to1.clicked.connect(self.zoom_1to1)
+        self.cmb_w2x_scale = QComboBox()
+        self.cmb_w2x_scale.addItems(["2x", "4x"])
+        self.cmb_w2x_scale.setFixedHeight(24)
+        self.cmb_w2x_noise = QComboBox()
+        self.cmb_w2x_noise.addItems(
+            ["不降噪", "降噪 0", "降噪 1", "降噪 2", "降噪 3"])
+        self.cmb_w2x_noise.setCurrentIndex(3)
+        self.cmb_w2x_noise.setFixedHeight(24)
+        self.btn_w2x = QPushButton("✨ waifu2x")
+        self.btn_w2x.setFixedHeight(24)
+        self.btn_w2x.setToolTip(
+            "AI 超分辨率（UpConv7 模型随包分发，纯 CPU 推理）：\n"
+            "对当前图片放大 2x/4x，可选降噪等级；完成后自动打开结果图")
+        self.btn_w2x.clicked.connect(self.run_waifu2x)
         row = QWidget()
         rl = QVBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
@@ -134,12 +153,16 @@ class ProImageViewer(QWidget):
         brow.addWidget(self.btn_fit)
         brow.addWidget(self.btn_1to1)
         brow.addStretch(1)
+        brow.addWidget(QLabel("AI 放大"))
+        brow.addWidget(self.cmb_w2x_scale)
+        brow.addWidget(self.cmb_w2x_noise)
+        brow.addWidget(self.btn_w2x)
         rl.addLayout(brow)
         rl.addWidget(self.view, 1)
         # 工业软件式操作提示行（看图区底部）
         self.lbl_tips = QLabel(
             "滚轮=缩放｜拖拽=平移｜双击/F=适配｜1=1:1｜M=放大镜｜"
-            "Alt 按住=临时放大镜｜放大镜时滚轮=倍率｜右下角=鸟瞰图定位")
+            "Alt 按住=临时放大镜｜放大镜时滚轮=倍率｜右下角=鸟瞰图｜✨=waifu2x 放大")
         self.lbl_tips.setStyleSheet("color:#8a8f98; font-size:11px;")
         rl.addWidget(self.lbl_tips)
         lay = QVBoxLayout(self)
@@ -175,6 +198,46 @@ class ProImageViewer(QWidget):
 
     def current_path(self) -> str | None:
         return self._path
+
+    # ---- waifu2x 超分辨率（预览入口） ----
+
+    def run_waifu2x(self) -> None:
+        """对当前图片做 waifu2x 放大（后台线程），完成后自动打开结果。"""
+        if not self._path:
+            self.state_message.emit("waifu2x：当前没有打开的图片")
+            return
+        if self._w2x_worker is not None and self._w2x_worker.isRunning():
+            self.state_message.emit("waifu2x：正在处理中，请稍候")
+            return
+        scale = 2 if self.cmb_w2x_scale.currentIndex() == 0 else 4
+        noise = self.cmb_w2x_noise.currentIndex() - 1   # 0 -> -1（不降噪）
+        self.btn_w2x.setEnabled(False)
+        self.btn_w2x.setText("✨ 0%…")
+        w, h = self._pm.width(), self._pm.height()
+        self.state_message.emit(
+            f"waifu2x：{w}x{h} → {w * scale}x{h * scale}，CPU 推理中…")
+        self._w2x_worker = Waifu2xWorker(self._path, scale=scale,
+                                         noise_level=noise)
+        self._w2x_worker.progress.connect(self._on_w2x_progress)
+        self._w2x_worker.done.connect(self._on_w2x_done)
+        self._w2x_worker.failed.connect(self._on_w2x_failed)
+        self._w2x_worker.start()
+
+    def _on_w2x_progress(self, v: float) -> None:
+        self.btn_w2x.setText(f"✨ {int(v * 100)}%…")
+
+    def _on_w2x_done(self, _arr, path: str) -> None:
+        self.btn_w2x.setEnabled(True)
+        self.btn_w2x.setText("✨ waifu2x")
+        self._w2x_worker = None
+        self.set_image(path)
+        self.state_message.emit(f"waifu2x 完成：已写盘 {path}")
+
+    def _on_w2x_failed(self, msg: str) -> None:
+        self.btn_w2x.setEnabled(True)
+        self.btn_w2x.setText("✨ waifu2x")
+        self._w2x_worker = None
+        self.state_message.emit(f"waifu2x 失败：{msg}")
 
     def pixmap_full(self) -> QPixmap:
         return self._pm

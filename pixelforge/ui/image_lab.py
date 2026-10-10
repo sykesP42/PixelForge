@@ -51,6 +51,7 @@ from pixelforge.processing.macro import (
     replay_folder,
     save_macro,
 )
+from pixelforge.ui.w2x_worker import Waifu2xWorker
 
 
 def _to_pixmap(arr: np.ndarray) -> QPixmap:
@@ -437,6 +438,7 @@ class ImageLab(QWidget):
         self._map: dict[int, tuple[int, int, int]] = {}   # 换色映射 {源索引: (B,G,R)}
         self._macro_steps: list[dict] = []                # 录制的宏步骤
         self._macro_worker = None
+        self._w2x_worker = None                           # waifu2x 后台线程
         # 定时器必须先于 _build_ui() 创建（_build_ui 会引用它）
         self._tol_timer = QTimer(self)            # 容差滑块防抖
         self._tol_timer.setSingleShot(True)
@@ -623,6 +625,28 @@ class ImageLab(QWidget):
         b_bleed.clicked.connect(self.bleed_now)
         el.addWidget(b_bleed)
         tools.addWidget(g_edit)
+
+        g_w2x = QGroupBox("waifu2x 超分辨率（AI 放大）")
+        wl = QVBoxLayout(g_w2x)
+        row_w2x = QHBoxLayout()
+        row_w2x.addWidget(QLabel("倍率"))
+        self.cmb_w2x_scale = QComboBox()
+        self.cmb_w2x_scale.addItems(["2x", "4x"])
+        row_w2x.addWidget(self.cmb_w2x_scale)
+        row_w2x.addWidget(QLabel("降噪"))
+        self.cmb_w2x_noise = QComboBox()
+        self.cmb_w2x_noise.addItems(
+            ["不降噪", "0（几乎无）", "1（轻）", "2（中）", "3（强）"])
+        self.cmb_w2x_noise.setCurrentIndex(2)
+        row_w2x.addWidget(self.cmb_w2x_noise, 1)
+        wl.addLayout(row_w2x)
+        self.btn_w2x = QPushButton("✨ waifu2x 放大当前图")
+        self.btn_w2x.setToolTip(
+            "UpConv7 模型随包分发，纯 CPU 推理；2x 约数秒~数十秒（视图大小），\n"
+            "建议 ≤ 200 万像素。像素画/动漫线稿效果最佳")
+        self.btn_w2x.clicked.connect(self.run_waifu2x)
+        wl.addWidget(self.btn_w2x)
+        tools.addWidget(g_w2x)
 
         g_adj = QGroupBox("色彩调整")
         al = QFormLayout(g_adj)
@@ -1534,6 +1558,54 @@ class ImageLab(QWidget):
     def _set_zoom(self, v: float) -> None:
         self._zoom = v
         self._render()
+
+    # ---------------- waifu2x 超分辨率 ----------------
+
+    def run_waifu2x(self) -> None:
+        """对当前画布做 waifu2x 放大（后台线程，完成后画布替换并可撤销）。"""
+        if self.arr is None:
+            self.state_changed.emit("waifu2x：请先打开一张图片")
+            return
+        if self._w2x_worker is not None and self._w2x_worker.isRunning():
+            self.state_changed.emit("waifu2x：正在处理中，请稍候")
+            return
+        scale = 2 if self.cmb_w2x_scale.currentIndex() == 0 else 4
+        noise = self.cmb_w2x_noise.currentIndex() - 1   # 0 -> -1（不降噪）
+        self.btn_w2x.setEnabled(False)
+        self.btn_w2x.setText("✨ waifu2x 处理中 0%…")
+        h, w = self.arr.shape[:2]
+        self.state_changed.emit(
+            f"waifu2x：{w}x{h} → {w * scale}x{h * scale}，CPU 推理中…")
+        self._w2x_worker = Waifu2xWorker(
+            self.arr.copy(), scale=scale, noise_level=noise,
+            out_dir=str(self.path.parent) if self.path else None)
+        self._w2x_worker.progress.connect(self._on_w2x_progress)
+        self._w2x_worker.done.connect(self._on_w2x_done)
+        self._w2x_worker.failed.connect(self._on_w2x_failed)
+        self._w2x_worker.start()
+
+    def _on_w2x_progress(self, v: float) -> None:
+        self.btn_w2x.setText(f"✨ waifu2x 处理中 {int(v * 100)}%…")
+
+    def _on_w2x_done(self, arr, path: str) -> None:
+        self.btn_w2x.setEnabled(True)
+        self.btn_w2x.setText("✨ waifu2x 放大当前图")
+        self._w2x_worker = None
+        self._push_undo()
+        self.arr = arr
+        self._preview = None
+        self._crop_rect = None
+        self._frames = []
+        self.lst_frames.clear()
+        self._render()
+        self.state_changed.emit(
+            f"waifu2x 完成：{arr.shape[1]}x{arr.shape[0]}，已写盘 {path}")
+
+    def _on_w2x_failed(self, msg: str) -> None:
+        self.btn_w2x.setEnabled(True)
+        self.btn_w2x.setText("✨ waifu2x 放大当前图")
+        self._w2x_worker = None
+        self.state_changed.emit(f"waifu2x 失败：{msg}")
 
     def _open_ab_compare(self) -> None:
         """⇋ A/B 对比：左=打开时的原图(A)，右=当前结果(B)，中缝可拖动。

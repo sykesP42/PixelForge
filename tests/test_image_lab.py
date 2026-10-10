@@ -304,6 +304,30 @@ def main() -> int:
     del il_mod
     print("[OK] 逐帧位移/缩放: 面板入口一键应用（全部帧相对画布中心右移 5px）+ 撤销回退")
 
+    # 18. waifu2x：工具坊入口（同步打桩）→ 画布替换 + 撤销 + 进度文案
+    from pixelforge.ui.w2x_worker import Waifu2xWorker
+    assert hasattr(lab, "cmb_w2x_scale") and hasattr(lab, "cmb_w2x_noise"), \
+        "工具坊应有 waifu2x 倍率/降噪控件"
+    wsrc = TMP / "w2x_src.png"
+    cv2.imwrite(str(wsrc), np.full((10, 10, 4), (40, 200, 40, 255), np.uint8))
+    lab.load_path(wsrc)
+    msgs2 = []
+    lab.state_changed.connect(msgs2.append)
+    orig_start = Waifu2xWorker.start
+    Waifu2xWorker.start = lambda self: self.run()
+    try:
+        lab.cmb_w2x_scale.setCurrentText("2x")
+        lab.btn_w2x.click()
+    finally:
+        Waifu2xWorker.start = orig_start
+    assert lab.arr is not None and lab.arr.shape[:2] == (20, 20), \
+        f"画布应变为 2x: {lab.arr.shape}"
+    assert any("waifu2x 完成" in m for m in msgs2), f"应有完成日志: {msgs2[-3:]}"
+    # 撤销应回到 10x10
+    lab.undo()
+    assert lab.arr.shape[:2] == (10, 10), "撤销应恢复原画布"
+    print("[OK] waifu2x: 工具坊放大（画布替换 + 写盘 + 撤销回退）")
+
     print("\n图像工具坊全部测试通过 ✔")
     return 0
 
