@@ -80,11 +80,19 @@ def img_to_data_uri_legacy(path: str, max_kb: int = 30) -> str:
         ext = "jpeg"
 
     im = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_COLOR)
-    if im is None:   # 非 OpenCV 可读格式：原样编码（不压缩）
-        b64 = base64.b64encode(raw).decode()
-        return f"data:image/{ext};base64,{b64}"
+    if im is None:   # 非 OpenCV 可读格式（GIF/WebP/EMF 等）→ PIL 解码
+        try:
+            import io
+            from PIL import Image
+            pim = Image.open(io.BytesIO(raw)).convert("RGB")
+            arr = np.array(pim)                      # RGB
+            im = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+        except Exception:  # noqa: BLE001  PIL 也读不了：原样编码
+            b64 = base64.b64encode(raw).decode()
+            return f"data:image/{ext};base64,{b64}"
 
     h, w = im.shape[:2]
+    best = None
     for quality in (92, 80, 70, 60, 50):
         for scale in (1.0, 0.85, 0.7, 0.55, 0.4):
             rw, rh = max(64, int(w * scale)), max(64, int(h * scale))
@@ -97,7 +105,16 @@ def img_to_data_uri_legacy(path: str, max_kb: int = 30) -> str:
             b64 = base64.b64encode(enc).decode()
             if len(b64) // 1024 <= max_kb:
                 return f"data:image/jpeg;base64,{b64}"
-    return f"data:image/jpeg;base64,{b64}"
+            best = b64 if best is None or len(b64) < len(best) else best
+    # 全档仍超标：最后一搏——强制缩到 320px 低质量（尽量保证能提交）
+    scale = min(1.0, 320 / max(h, w))
+    rw, rh = max(64, int(w * scale)), max(64, int(h * scale))
+    ok, enc = cv2.imencode(
+        ".jpg", cv2.resize(im, (rw, rh), interpolation=cv2.INTER_AREA),
+        [cv2.IMWRITE_JPEG_QUALITY, 30])
+    if ok:   # 320px 档是所有档里最小的：即便略超 max_kb 也优先返回
+        return f"data:image/jpeg;base64,{base64.b64encode(enc).decode()}"
+    return best or f"data:image/jpeg;base64,{base64.b64encode(raw).decode()}"
 
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -184,6 +201,103 @@ def _save_image(src: str, out_dir: Path, tag: str) -> Path:
         return out
     _download(src, out)
     return out
+
+
+# NANO-BANANA 系列（gemini 接口）：GUI 别名 → 中转站真实模型名
+NANO_ALIASES = {
+    "nano-banana": "gemini-2.5-flash-image",
+    "nano-banana-pro": "gemini-3-pro-image-preview",
+    "nano-banana-2": "gemini-3.1-flash-image-preview",
+}
+
+
+def _generate_nano(api_key: str, base_url: str, prompt: str,
+                   ref_paths: list[str] | None, model: str, size: str,
+                   out_dir: Path, timeout_s: int = 900,
+                   oversea: bool = False, should_cancel=None,
+                   log=print) -> Path:
+    """NANO-BANANA（gemini）系列：文生图 / 图生图（编辑）+ 任务轮询。
+
+    - 文生图  POST {base}/api/gemini/nano-banana
+    - 图生图  POST {base}/api/gemini/nano-banana-edit（image_urls 仅公网 URL）
+    - 轮询    GET  {base}/api/gemini/nano-banana/{task_id}
+    """
+    import math
+    base = _sanitize_base(base_url)
+    model = NANO_ALIASES.get(model.strip().lower(), model.strip())
+    body: dict = {"model": model, "prompt": prompt, "oversea": bool(oversea)}
+    k = (size or "1k").strip().lower()
+    if k in ("1k", "2k", "4k"):
+        body["image_size"] = k.upper()   # K 大写；nano-pro / nano-2 支持
+    if ref_paths:
+        endpoint = f"{base}/api/gemini/nano-banana-edit"
+        urls = []
+        for p in ref_paths:
+            p = str(p)
+            if p.startswith("http://") or p.startswith("https://"):
+                urls.append(p)
+                continue
+            log(f"  参考图上传图床（nano 系列要求公网 URL）: {Path(p).name}")
+            url = _upload_tmpfiles(p)
+            if not url:
+                raise CloudEngineError(
+                    f"参考图上传图床失败: {p}\n"
+                    "nano-banana 系列不支持 base64，请检查网络或改用 gpt-image 系列")
+            urls.append(url)
+        if urls:
+            body["image_urls"] = urls
+    else:
+        endpoint = f"{base}/api/gemini/nano-banana"
+
+    log(f"  提交云端任务: {base}  模型 {model}")
+    resp = _post_json(endpoint, body, api_key)
+    if resp.get("code") not in (None, 200, "200"):
+        raise CloudEngineError(f"提交失败: {resp.get('msg', resp)[:200]}")
+    tid = (resp.get("data") or {}).get("task_id") or resp.get("id")
+    if not tid:
+        raise CloudEngineError(f"中转未返回 task_id: {str(resp)[:200]}")
+    log(f"  中转返回异步任务: {tid[:12]}...")
+
+    # 轮询（响应结构 {code,msg,data:{state,data:{images[]}}}）
+    start = time.monotonic()
+    deadline = start + timeout_s
+    last_pct = -1
+    while time.monotonic() < deadline:
+        time.sleep(5)
+        if should_cancel and should_cancel():
+            raise CloudEngineError("⏹ 任务已停止")
+        r = _get_json(f"{base}/api/gemini/nano-banana/{tid}", api_key)
+        if r.get("code") not in (200, "200"):
+            continue
+        d = r.get("data") or {}
+        state = str(d.get("state") or "").lower()
+        if state in ("succeeded", "success", "completed", "done"):
+            try:
+                _persist_task(d, base, tid, out_dir)
+            except Exception:  # noqa: BLE001
+                pass
+            inner = d.get("data") or {}
+            imgs = [i.get("url") for i in (inner.get("images") or [])
+                    if i.get("url")]
+            if not imgs:
+                raise CloudEngineError(
+                    f"任务成功但无图片: {json.dumps(d, ensure_ascii=False)[:300]}")
+            log("  99% 生成完成，正在下载图片...")
+            try:
+                return _save_image(imgs[0], out_dir, "nano")
+            except CloudEngineError as e:
+                raise CloudEngineError(
+                    f"{e}\n任务 id 已保存: task_{tid}.json（可手动重试下载）") from e
+        if state in ("failed", "error", "cancelled"):
+            err = d.get("msg") or ""
+            raise CloudEngineError(f"云端任务失败: {state} {str(err)[:200]}")
+        elapsed = time.monotonic() - start
+        est_pct = min(95, int(100 * (1 - math.exp(-elapsed / 45))))
+        if est_pct != last_pct:
+            last_pct = est_pct
+            log(f"  云端生成中... {est_pct}%（已等待 {int(elapsed)}s，"
+                f"通常 1~3 分钟）")
+    raise CloudEngineError(f"云端任务超时（{timeout_s}s）")
 
 
 def _upload_tmpfiles(path: str, timeout: int = 60) -> str:
@@ -324,20 +438,29 @@ def generate_grid(api_key: str, base_url: str, prompt: str,
                   ref_paths: list[str] | None, model: str, size: str,
                   out_dir: Path, timeout_s: int = 900,
                   background: str = "auto",
+                  quality: str = "medium",
+                  oversea: bool = False,
                   should_cancel=None,
                   log=print) -> Path:
-    """通用云端生成：自动适配同步（OpenAI 标准）与异步（多米）两种中转。
+    """通用云端生成：按模型自动路由 gpt-image / nano-banana 系列中转。
 
     返回网格图路径。入口处硬校验 prompt/size/quality/background，
     非法参数在本地即报错，不会发出无效请求。
     """
+    if (model or "").strip().lower() in NANO_ALIASES or \
+            (model or "").strip().lower().startswith("gemini-"):
+        return _generate_nano(api_key, base_url, prompt, ref_paths,
+                              model, size, out_dir, timeout_s,
+                              oversea=oversea, should_cancel=should_cancel,
+                              log=log)
     out_dir.mkdir(parents=True, exist_ok=True)
     base = _sanitize_base(base_url)
     prompt = validate_prompt(prompt)
     size = _normalize_size(size, (1536, 768))
     background = validate_background(background)
+    quality = validate_quality(quality)
     body: dict = {"model": model, "prompt": prompt, "size": size,
-                  "quality": "medium", "oversea": False}
+                  "quality": quality, "oversea": bool(oversea)}
     if background != "auto":
         body["background"] = background
     if not (model or "").strip():
@@ -363,7 +486,11 @@ def generate_grid(api_key: str, base_url: str, prompt: str,
             break
         except CloudEngineError as e:
             if "HTTP 4" in str(e)[:8]:
-                raise   # 请求错误不重试
+                hint = ""
+                if "HTTP 400" in str(e)[:9]:
+                    hint = ("\n建议：① 参考图过大或不被支持（可换 PNG/JPG 或去掉参考图）；"
+                            "② 检查模型名是否为该中转站支持的模型")
+                raise CloudEngineError(f"{e}{hint}") from e   # 请求错误不重试
             last_err = e
             log(f"  网络抖动重试 {attempt + 1}/4: {str(e)[:60]}")
         except (urllib.error.URLError, TimeoutError, OSError) as e:

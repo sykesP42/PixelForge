@@ -57,6 +57,9 @@ class Settings:
     gpt_api_key: str = ""             # 中转站控制台的 API Key
     gpt_model: str = "gpt-image-2"    # gpt-image-2 / nano-banana / seedream / Flux / 自定义
     gpt_size: str = "1k"              # 1k / 2k / 4k
+    gpt_quality: str = "medium"       # 思考深度：low / medium / high
+    gpt_oversea: bool = False         # True = 海外线路（oversea=true）
+    gpt_background: str = "auto"      # auto / opaque / transparent
 
     # UI 模式：0=笨蛋（极简） 1=专注（核心） 2=专业（全量）
     ui_mode: int = 1
