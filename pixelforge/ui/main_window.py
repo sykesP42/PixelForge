@@ -190,6 +190,7 @@ class _GPTEngineWorker(QRunnable):
         self.cancelled = True
 
     def run(self) -> None:
+        from pixelforge.error_hints import is_retryable_error
         from pixelforge.gpt_engine import (
             CloudEngineError,
             generate_grid,
@@ -211,15 +212,8 @@ class _GPTEngineWorker(QRunnable):
                 # 笨蛋模式动作即整段提示词，避免 "prompt — prompt" 重复
                 full_prompt = (base if action_desc == self.s.prompt
                                else f"{base} — {action_desc}")
-                grid = generate_grid(
-                    self.s.gpt_api_key, self.s.gpt_base_url,
-                    full_prompt,
-                    refs, self.s.gpt_model, self.s.gpt_size, out_dir,
-                    quality=getattr(self.s, "gpt_quality", "medium"),
-                    oversea=bool(getattr(self.s, "gpt_oversea", False)),
-                    background=getattr(self.s, "gpt_background", "auto"),
-                    should_cancel=lambda: self.cancelled,
-                    log=lambda m: self.sig.progress.emit(m))
+                grid = self._generate_with_retry(
+                    generate_grid, full_prompt, refs, tag, out_dir)
                 grid_paths.append(str(grid))
                 self.sig.progress.emit(
                     f"[GPT] {tag} 完成: {Path(grid).name}")
@@ -228,6 +222,36 @@ class _GPTEngineWorker(QRunnable):
             self.sig.failed.emit(str(e))
         except Exception as e:  # noqa: BLE001
             self.sig.failed.emit(f"{type(e).__name__}: {e}")
+
+    def _generate_with_retry(self, generate_grid, full_prompt: str,
+                             refs: list, tag: str, out_dir) -> str:
+        """单个动作生成，网络类错误自动重试 2 次（指数退避 5s/10s，可中断）。"""
+        from pixelforge.error_hints import is_retryable_error
+        from pixelforge.gpt_engine import CloudEngineError
+        max_retry = 2
+        for attempt in range(max_retry + 1):
+            try:
+                return generate_grid(
+                    self.s.gpt_api_key, self.s.gpt_base_url,
+                    full_prompt,
+                    refs, self.s.gpt_model, self.s.gpt_size, out_dir,
+                    quality=getattr(self.s, "gpt_quality", "medium"),
+                    oversea=bool(getattr(self.s, "gpt_oversea", False)),
+                    background=getattr(self.s, "gpt_background", "auto"),
+                    should_cancel=lambda: self.cancelled,
+                    log=lambda m: self.sig.progress.emit(m))
+            except CloudEngineError as e:
+                if (self.cancelled or attempt >= max_retry
+                        or not is_retryable_error(str(e))):
+                    raise
+                wait = 5 * (attempt + 1)
+                self.sig.progress.emit(
+                    f"[GPT] {tag} 网络类错误，{wait}s 后自动重试 "
+                    f"{attempt + 1}/{max_retry}: {str(e)[:120]}")
+                for _ in range(wait * 10):   # 可中断退避
+                    if self.cancelled:
+                        raise CloudEngineError("⏹ 任务已停止")
+                    time.sleep(0.1)
 
 
 class _GenerateWorker(QRunnable):
@@ -277,13 +301,29 @@ class _GenerateWorker(QRunnable):
                 self._run_series(client, workflow, seed)
                 return
             t0 = time.monotonic()
-            paths = client.generate(workflow, s.output_path(), timeout=900)
+            paths = self._generate_with_retry_local(client, workflow, s)
             self.sig.progress.emit(f"生成完成，耗时 {time.monotonic() - t0:.1f}s")
             self.sig.done.emit({"paths": [str(p) for p in paths], "seed": seed})
         except ComfyUIError as e:
             self.sig.failed.emit(str(e))
         except Exception as e:  # noqa: BLE001
             self.sig.failed.emit(f"{type(e).__name__}: {e}")
+
+    def _generate_with_retry_local(self, client, workflow, s) -> list:
+        """本地单帧生成：网络类错误自动重试 2 次（5s/10s 退避）。"""
+        from pixelforge.error_hints import is_retryable_error
+        max_retry = 2
+        for attempt in range(max_retry + 1):
+            try:
+                return client.generate(workflow, s.output_path(), timeout=900)
+            except ComfyUIError as e:
+                if attempt >= max_retry or not is_retryable_error(str(e)):
+                    raise
+                wait = 5 * (attempt + 1)
+                self.sig.progress.emit(
+                    f"网络类错误，{wait}s 后自动重试 {attempt + 1}/{max_retry}"
+                    f": {str(e)[:120]}")
+                time.sleep(wait)
 
     def _series_template(self) -> dict | None:
         """worker 用：传入模板含 __IMAGE__ 时用于系列生成（Qwen i2i 等）。"""

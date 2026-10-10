@@ -37,3 +37,33 @@ def translate_error(msg: str) -> str:
         if any(k in low for k in keys):
             return f"{msg}\n\n建议：{hint}"
     return msg
+
+
+# ---- 网络类错误自动重试分类 ----
+
+_RETRYABLE_KEYS = (
+    "网络错误", "timed out", "timeout", "同步请求重试均失败",
+    "图片下载全部通道失败", "图床上传失败",
+    "connection", "urlopen error", "10061", "临时维护", "系统繁忙",
+    "upstream", "http 429", "http 500", "http 502", "http 503",
+    "http 504", "http 529", "远程主机", "connectionreset",
+)
+_NON_RETRYABLE_KEYS = (
+    "已停止", "提示词为空", "模型名不能为空", "api key", "鉴权",
+    "审核", "敏感", "崩坏", "拆帧不足", "云端任务超时",
+    "http 400", "http 401", "http 403", "http 404",
+    "value not in list", "ckpt_name", "checkpoint", "out of memory",
+    "cuda", "lora", "control_net", "failed to validate",
+)
+
+
+def is_retryable_error(msg: str) -> bool:
+    """判断是否为可自动重试的网络类错误（重试有意义且不会白花钱）。
+
+    规则：先排除「确定性失败」（鉴权/参数/审核/已停止/OOM 等），
+    再命中「瞬时性失败」（连接/超时/5xx/上游繁忙）。
+    """
+    low = (msg or "").lower()
+    if any(k in low for k in _NON_RETRYABLE_KEYS):
+        return False
+    return any(k in low for k in _RETRYABLE_KEYS)
