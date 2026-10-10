@@ -528,6 +528,10 @@ class ImageLab(QWidget):
         b_pl = QPushButton("锁定调色板...")
         b_pl.clicked.connect(self._load_palette_dialog)
         row_pal.addWidget(b_pl)
+        b_pe = QPushButton("从图吸取...")
+        b_pe.clicked.connect(self._pick_palette_dialog)
+        b_pe.setToolTip("从当前图或任意图片提取主色板（跨批统一色板）")
+        row_pal.addWidget(b_pe)
         b_ps = QPushButton("保存当前调色板")
         b_ps.clicked.connect(self._save_palette_dialog)
         row_pal.addWidget(b_ps)
@@ -1245,6 +1249,39 @@ class ImageLab(QWidget):
         self.lbl_palette.setText(f"调色板：已锁定 {len(self._locked_palette)} 色")
         self._refresh_swatch()
         self.status(f"已锁定调色板 {len(self._locked_palette)} 色（来自 {Path(f).name}）")
+
+    def _pick_palette_dialog(self) -> None:
+        """从当前图（或选择的图片文件）吸取主色板并锁定。"""
+        from pixelforge.processing.image_processor import extract_palette
+        arr = self.arr
+        name = self.path.name if getattr(self, "path", None) else None
+        if arr is None:
+            f, _ = QFileDialog.getOpenFileName(
+                self, "吸取调色板（选择图片）", "",
+                "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif)")
+            if not f:
+                return
+            data = np.fromfile(f, dtype=np.uint8)
+            arr = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+            if arr is None:
+                QMessageBox.warning(self, "图像工具坊", f"无法读取: {f}")
+                return
+            name = Path(f).name
+        from PySide6.QtWidgets import QInputDialog
+        k, ok = QInputDialog.getInt(
+            self, "吸取调色板", "颜色数（主色聚类）", 16, 2, 32)
+        if not ok:
+            return
+        try:
+            pal = extract_palette(arr, k=k)
+        except ValueError as e:
+            QMessageBox.warning(self, "图像工具坊", str(e))
+            return
+        self._locked_palette = pal
+        src = f"（吸取自 {name}）" if name else ""
+        self.lbl_palette.setText(f"调色板：已锁定 {len(pal)} 色 {src}")
+        self._refresh_swatch()
+        self.status(f"已吸取调色板 {len(pal)} 色{src}，裁切/换色将统一到该色板")
 
     def _save_palette_dialog(self) -> None:
         if not self._locked_palette:

@@ -328,6 +328,42 @@ def main() -> int:
     assert lab.arr.shape[:2] == (10, 10), "撤销应恢复原画布"
     print("[OK] waifu2x: 工具坊放大（画布替换 + 写盘 + 撤销回退）")
 
+    # 19. 调色板吸取：从当前图提取主色板并锁定（QInputDialog 打桩）
+    from PySide6.QtWidgets import QInputDialog
+    from pixelforge.processing.image_processor import extract_palette
+    flat = np.zeros((8, 8, 4), np.uint8)
+    flat[:, :] = (90, 45, 200, 255)   # 单色
+    pal0 = extract_palette(flat, k=8)
+    assert pal0 == [[90, 45, 200]], f"平色图应提取唯一色: {pal0}"
+    quad = np.zeros((8, 8, 4), np.uint8)
+    quad[:4, :4] = (0, 0, 255, 255)     # 红 (BGR)
+    quad[:4, 4:] = (0, 255, 0, 255)     # 绿
+    quad[4:, :4] = (255, 0, 0, 255)     # 蓝
+    quad[4:, 4:] = (255, 255, 255, 255)  # 白
+    pquad = TMP / "quad_pal.png"
+    cv2.imwrite(str(pquad), quad)
+    lab.load_path(pquad)
+    orig_getint = QInputDialog.getInt
+    QInputDialog.getInt = lambda *a, **k: (4, True)
+    try:
+        lab._pick_palette_dialog()
+    finally:
+        QInputDialog.getInt = orig_getint
+    assert lab._locked_palette, "吸取后应有锁定调色板"
+    got = {tuple(c) for c in lab._locked_palette}
+    expect = {(0, 0, 255), (0, 255, 0), (255, 0, 0), (255, 255, 255)}
+    assert got <= expect, f"提取色应来自图中四色: {got}"
+    assert "吸取自" in lab.lbl_palette.text(), lab.lbl_palette.text()
+    # 取消（ok=False）→ 调色板保持不变
+    pal_before = [list(c) for c in lab._locked_palette]
+    QInputDialog.getInt = lambda *a, **k: (16, False)
+    try:
+        lab._pick_palette_dialog()
+    finally:
+        QInputDialog.getInt = orig_getint
+    assert [list(c) for c in lab._locked_palette] == pal_before, "取消不应修改调色板"
+    print("[OK] 调色板吸取: 纯函数平色/四色提取 + 入口锁定 + 取消保护")
+
     print("\n图像工具坊全部测试通过 ✔")
     return 0
 

@@ -809,6 +809,35 @@ def frame_hull(image: np.ndarray, epsilon: float = 1.5) -> list[float]:
     return [float(v) for p in pts for v in p]
 
 
+def extract_palette(image: np.ndarray, k: int = 16) -> list:
+    """从 BGRA/BGR 图提取主色板（忽略透明像素），返回 BGR 颜色列表。
+
+    k-means 聚类主色，采样上限 20000 像素加速；唯一色数少于 k 时直接返回全部唯一色。
+    """
+    if image is None or image.ndim < 3:
+        raise ValueError("需要彩色图像（BGR/BGRA）")
+    bgr = image[:, :, :3]
+    if image.shape[2] == 4:
+        mask = image[:, :, 3] > 0
+    else:
+        mask = np.ones(bgr.shape[:2], dtype=bool)
+    px = bgr[mask]
+    if px.size == 0:
+        raise ValueError("画面全透明，无可提取的颜色")
+    data = px.astype(np.float32)
+    if data.shape[0] > 20000:  # 采样加速
+        data = data[np.random.default_rng(0).choice(
+            data.shape[0], 20000, replace=False)]
+    uniq = np.unique(data.astype(np.uint8), axis=0)
+    if uniq.shape[0] <= max(1, k):
+        return [list(map(int, c)) for c in uniq]
+    k = max(2, min(int(k), 32))
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    _, _, centers = cv2.kmeans(
+        data, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+    return [list(map(int, c)) for c in centers.astype(np.int32)]
+
+
 def remap_palette_colors(image: np.ndarray, palette: list,
                          mapping: dict) -> np.ndarray:
     """换色引擎：像素吸附到最近调色板色，再按 {源索引: (B,G,R)} 替换目标色。
