@@ -1,0 +1,12 @@
+waifu2x 模型权重（pixelforge/models/waifu2x/*.npz）
+====================================================
+
+来源：PyPI 包 waifu2x 2024.0.1（FHPythonUtils/Waifu2x，MIT License）
+  https://github.com/FHPythonUtils/Waifu2x
+其权重又源自：
+  - nagadomi/waifu2x（MIT License）
+  - tsurumeso/waifu2x-chainer（MIT License）
+架构：UpConv7（anime_style，rgb 通道）
+
+本目录文件仅做格式整理（npz 重新压缩），未改动数值。
+依据 MIT 许可随 PixelForge 分发；上游版权声明见上列仓库。
