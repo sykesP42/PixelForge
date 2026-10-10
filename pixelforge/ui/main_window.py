@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSettings, QSize, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QCursor, QImage, QPixmap
+from PySide6.QtGui import QCursor, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox, QApplication, QComboBox, QDialog, QDockWidget, QDoubleSpinBox,
     QFileDialog,
@@ -211,6 +211,9 @@ class _GPTEngineWorker(QRunnable):
                     self.s.gpt_api_key, self.s.gpt_base_url,
                     full_prompt,
                     refs, self.s.gpt_model, self.s.gpt_size, out_dir,
+                    quality=getattr(self.s, "gpt_quality", "medium"),
+                    oversea=bool(getattr(self.s, "gpt_oversea", False)),
+                    background=getattr(self.s, "gpt_background", "auto"),
                     should_cancel=lambda: self.cancelled,
                     log=lambda m: self.sig.progress.emit(m))
                 grid_paths.append(str(grid))
@@ -715,9 +718,11 @@ class MainWindow(QMainWindow):
         self._gpt_workers: dict = {}  # task_no -> worker（停止用）
         self._task_snaps: dict = {}   # task_no -> 生成快照（登记提示词用）
         self._qid_of_tn: dict = {}    # task_no -> 持久化队列记录 id
+        self._qo_syncing = False      # 画质/线路控件双向同步防循环
         self._connected_once = False  # 首次连接成功时自动拉取模型列表
 
         self._build_ui()
+        self._wire_quality_oversea()
         self._load_settings_to_ui()
         self._refresh_workflows()
         self._refresh_profiles()
@@ -732,7 +737,7 @@ class MainWindow(QMainWindow):
         if state is not None:
             self.restoreState(state)
         # 左侧配置面板给足默认宽度（避免内容挤压）；右侧日志 340
-        self.resizeDocks([self.dock_config, self.dock_log], [400, 340],
+        self.resizeDocks([self.dock_config, self.dock_log], [460, 340],
                          Qt.Horizontal)
 
         self._conn_timer = QTimer(self)
@@ -846,7 +851,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(g_basic)
 
         g_basic_res = QGroupBox("输出参数（当前生成设置一览）")
-        fres = QHBoxLayout(g_basic_res)
+        fres = QHBoxLayout()   # 注意：g_basic_res 只能有 fres2 一个顶层布局
         self.btn_res_1k = QPushButton("1K（标准）")
         self.btn_res_2k = QPushButton("2K（高清）")
         self.btn_res_4k = QPushButton("4K（超清·更慢）")
@@ -864,8 +869,25 @@ class MainWindow(QMainWindow):
         self.lbl_basic_info = QLabel("（参数信息）")
         self.lbl_basic_info.setObjectName("dimTip")
         self.lbl_basic_info.setWordWrap(True)
+        # 画质 + 线路（与设置对话框的 cmb_gpt_quality/chk_gpt_oversea 双向同步）
+        qo_row = QHBoxLayout()
+        qo_row.addWidget(QLabel("画质"))
+        self.cmb_basic_quality = QComboBox()
+        self.cmb_basic_quality.addItems(
+            ["low（快速）", "medium（标准）", "high（精细）"])
+        self.cmb_basic_quality.setCurrentIndex(1)
+        self.cmb_basic_quality.setToolTip(
+            "思考深度：low 快而省、medium 标准、high 最精细最慢")
+        qo_row.addWidget(self.cmb_basic_quality, 1)
+        qo_row.addWidget(QLabel("线路"))
+        self.cmb_basic_oversea = QComboBox()
+        self.cmb_basic_oversea.addItems(["国内线路", "海外线路"])
+        self.cmb_basic_oversea.setToolTip(
+            "海外线路 = oversea=true；默认国内线路")
+        qo_row.addWidget(self.cmb_basic_oversea, 1)
         fres2 = QVBoxLayout(g_basic_res)
         fres2.addLayout(fres)
+        fres2.addLayout(qo_row)
         fres2.addWidget(self.lbl_basic_info)
         self._refresh_basic_info()
         lay.addWidget(g_basic_res)
@@ -941,12 +963,18 @@ class MainWindow(QMainWindow):
         self.cmb_gen_history = QComboBox()
         self.cmb_gen_history.setToolTip(
             "生成历史快照：每次生成自动记录当时的全部设置（含提示词/参数/引擎），\n"
-            "选择即恢复到该次生成前的完整配置")
+            "选择即恢复到该次生成前的完整配置；悬停条目可预览参考图/生成图/提示词")
         hist_row.addWidget(self.cmb_gen_history, 1)
         b_hist = QPushButton("加载")
         b_hist.clicked.connect(self._load_gen_snapshot)
         hist_row.addWidget(b_hist)
         f2.addRow("历史快照", hist_row)
+        # 悬停浮窗：预览该快照的参考图/生成图/提示词
+        _hv = self.cmb_gen_history.view()
+        _hv.setMouseTracking(True)
+        _hv.entered.connect(lambda mi: self._on_history_hover(mi.row()))
+        _hv.viewport()._pf_hide_hover = True
+        _hv.viewport().installEventFilter(self)
 
         self.ed_prompt = QPlainTextEdit()
         self.ed_prompt.setPlaceholderText(
@@ -1023,6 +1051,29 @@ class MainWindow(QMainWindow):
                           self.ed_ref, b_ref, b_refclr,
                           self.ed_actions, self.chk_auto_post]
         self._g2_basic: list = []   # 笨蛋模式用独立卡片（_basic_cards）
+        # ---- 专注/专业的核心云端行：思考深度放主界面（模型/尺寸/线路/背景在设置对话框）----
+        self._form_g2.addRow("画质（思考深度）", self.cmb_gpt_quality)
+        self._g2_focus.extend([self.cmb_gpt_quality])
+        # ---- 专业模式专属行（专注隐藏）----
+        self._lbl_pro_sep = QLabel("— 专业选项 —")
+        self._form_g2.addRow(self._lbl_pro_sep)
+        lora_row = QHBoxLayout()
+        lora_row.addWidget(self.ed_lora, 1)
+        lora_row.addWidget(self.spin_lora)
+        self._form_g2.addRow("LoRA（名称/强度）", lora_row)
+        self._form_g2.addRow(self.chk_i2i)
+        self._form_g2.addRow("系列模式", self.cmb_mode)
+        self._form_g2.addRow("系列帧数", self.spin_i2i_n)
+        self._form_g2.addRow("重绘强度", self.slide_i2i_denoise)
+        self._form_g2.addRow(self.chk_pose)
+        self._form_g2.addRow("ControlNet", self.cmb_cn)
+        self._form_g2.addRow("骨架图序列", self.lst_pose)
+        self._form_g2.addRow("姿势强度", self.spin_pose_str)
+        self._g2_pro = [
+            self._lbl_pro_sep,
+            self.ed_lora, self.spin_lora, self.chk_i2i, self.cmb_mode,
+            self.spin_i2i_n, self.slide_i2i_denoise, self.chk_pose,
+            self.cmb_cn, self.lst_pose, self.spin_pose_str]
 
         # ---- 菜单栏顶栏：引擎切换居中 + 右侧模式切换/停止/设置 ----
         corner = QWidget()
@@ -1075,11 +1126,12 @@ class MainWindow(QMainWindow):
         self._apply_ui_mode(self.settings.ui_mode)
 
         # 滚动容器：内容超长时可滚动（修复无法滚动问题）
+        w.setMinimumWidth(430)   # 保证行内按钮不被压缩；窄窗口出横向滚动条
         scroll = QScrollArea()
         scroll.setWidget(w)
         scroll.setWidgetResizable(True)
         scroll.setMinimumWidth(400)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         return scroll
 
     def _build_engine_widgets(self) -> None:
@@ -1107,12 +1159,31 @@ class MainWindow(QMainWindow):
         self.cmb_gpt_model = QComboBox()
         self.cmb_gpt_model.setEditable(True)
         self.cmb_gpt_model.addItems([
-            "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-1",
-            "nano-banana", "seedream-3.0", "flux-pro-1.1"])
+            "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
+            "nano-banana", "nano-banana-pro", "nano-banana-2",
+            "gpt-image-1", "seedream-3.0", "flux-pro-1.1"])
         self.cmb_gpt_model.setToolTip(
-            "常见模型下拉选择，也可手动输入中转站支持的任意模型名")
+            "常见模型下拉选择，也可手动输入中转站支持的任意模型名\n"
+            "gpt-image-* 走 /v1/images/generations；\n"
+            "nano-banana*（gemini 系列）走 /api/gemini/nano-banana，"
+            "参考图自动上传图床")
         self.cmb_gpt_size = QComboBox()
         self.cmb_gpt_size.addItems(["1k", "2k", "4k"])
+        self.cmb_gpt_quality = QComboBox()
+        self.cmb_gpt_quality.addItems(
+            ["low（快速）", "medium（标准）", "high（精细）"])
+        self.cmb_gpt_quality.setCurrentIndex(1)
+        self.cmb_gpt_quality.setToolTip(
+            "思考深度：low 快而省、medium 标准、high 最精细最慢")
+        self.chk_gpt_oversea = QCheckBox("海外线路（oversea）")
+        self.chk_gpt_oversea.setToolTip(
+            "勾选 = 走 oversea=true 海外线路；默认国内线路")
+        self.cmb_gpt_bg = QComboBox()
+        self.cmb_gpt_bg.addItems(
+            ["背景 auto（跟随提示词）", "opaque（不透明）",
+             "transparent（透明）"])
+        self.cmb_gpt_bg.setToolTip(
+            "transparent = 透明背景（gpt-image 系列）")
         self.chk_gpt.toggled.connect(
             lambda _: self._update_generate_button_text())
         self.ed_gpt_key.textChanged.connect(
@@ -1375,24 +1446,14 @@ class MainWindow(QMainWindow):
         f1.addRow("API Key", self.ed_gpt_key)
         f1.addRow("模型", self.cmb_gpt_model)
         f1.addRow("分辨率档", self.cmb_gpt_size)
+        f1.addRow(self.chk_gpt_oversea)
+        f1.addRow("背景", self.cmb_gpt_bg)
+        f1.addRow(QLabel("思考深度（画质）在主界面「生成设置」/笨蛋模式中选择。"))
         tabs.addTab(w1, "引擎与 API")
 
-        # 标签 2：高级生成
+        # 标签 2：高级生成（LoRA/系列/骨架已移至主界面专业模式）
         w2 = QWidget()
         f2b = QFormLayout(w2)
-        f2b.addRow(QLabel("— LoRA —"))
-        f2b.addRow("LoRA 名称", self.ed_lora)
-        f2b.addRow("LoRA 强度", self.spin_lora)
-        f2b.addRow(QLabel("— 系列生成 —"))
-        f2b.addRow(self.chk_i2i)
-        f2b.addRow("系列模式", self.cmb_mode)
-        f2b.addRow("系列帧数", self.spin_i2i_n)
-        f2b.addRow("重绘强度", self.slide_i2i_denoise)
-        f2b.addRow(QLabel("— 骨架驱动（ControlNet OpenPose）—"))
-        f2b.addRow(self.chk_pose)
-        f2b.addRow("ControlNet", self.cmb_cn)
-        f2b.addRow("骨架图序列", self.lst_pose)
-        f2b.addRow("姿势强度", self.spin_pose_str)
         f2b.addRow(QLabel("— 模型 —"))
         f2b.addRow("工作流模板", self.cmb_workflow)
         f2b.addRow("模型 Checkpoint", self.cmb_ckpt)
@@ -1486,6 +1547,37 @@ class MainWindow(QMainWindow):
         self.btn_generate.setText("生成")
         self.btn_generate_basic.setText("🎨  生成")
 
+    def _wire_quality_oversea(self) -> None:
+        """笨蛋模式与设置对话框的 画质/线路 控件双向同步。"""
+        self.cmb_basic_quality.currentIndexChanged.connect(
+            self._on_basic_qo_changed)
+        self.cmb_basic_oversea.currentIndexChanged.connect(
+            self._on_basic_qo_changed)
+        self.cmb_gpt_quality.currentIndexChanged.connect(
+            self._on_dialog_qo_changed)
+        self.chk_gpt_oversea.toggled.connect(self._on_dialog_qo_changed)
+
+    def _on_basic_qo_changed(self, *_):
+        if self._qo_syncing:
+            return
+        self._qo_syncing = True
+        self.cmb_gpt_quality.setCurrentIndex(
+            self.cmb_basic_quality.currentIndex())
+        self.chk_gpt_oversea.setChecked(
+            self.cmb_basic_oversea.currentIndex() == 1)
+        self._qo_syncing = False
+        self._refresh_basic_info()
+
+    def _on_dialog_qo_changed(self, *_):
+        if self._qo_syncing:
+            return
+        self._qo_syncing = True
+        self.cmb_basic_quality.setCurrentIndex(
+            self.cmb_gpt_quality.currentIndex())
+        self.cmb_basic_oversea.setCurrentIndex(
+            1 if self.chk_gpt_oversea.isChecked() else 0)
+        self._qo_syncing = False
+
     def _refresh_basic_info(self) -> None:
         """笨蛋模式「输出参数」只读信息：实际像素/模型/参考图/输出目录。"""
         if not hasattr(self, "lbl_basic_info"):
@@ -1497,6 +1589,11 @@ class MainWindow(QMainWindow):
             self, "cmb_gpt_model") else "gpt-image-2"
         engine = "云端 GPT-Image" if self.chk_gpt.isChecked() else "本地 ComfyUI"
         n = len(getattr(self, "_basic_ref_paths", []) or [])
+        quality = self.cmb_basic_quality.currentText().split("（")[0] \
+            if hasattr(self, "cmb_basic_quality") else "medium"
+        route = "海外" if (hasattr(self, "cmb_basic_oversea")
+                           and self.cmb_basic_oversea.currentIndex() == 1) \
+            else "国内"
         try:
             out_dir = str(self.settings.output_path())
         except Exception:  # noqa: BLE001
@@ -1505,6 +1602,7 @@ class MainWindow(QMainWindow):
             f"引擎 {engine} ｜ 模型 {model}\n"
             f"输出尺寸 {size} → {tier.get(size, size)} 像素"
             f"（网格图，切分在工具坊完成）\n"
+            f"画质 {quality} ｜ 线路 {route}\n"
             f"参考图 {n} 张（留空 = 文生图） ｜ 输出目录 {out_dir}")
 
     def _basic_res_pick(self, size: str) -> None:
@@ -1533,6 +1631,9 @@ class MainWindow(QMainWindow):
         # 核心区：笨蛋隐藏（用笨蛋卡片），专注/专业显示
         for wdg in self._g2_focus:
             self._set_row_visible(self._form_g2, wdg, not basic)
+        # 专业专属行：仅专业模式显示
+        for wdg in getattr(self, "_g2_pro", []):
+            self._set_row_visible(self._form_g2, wdg, mode == 2)
         # 笨蛋卡片：仅笨蛋显示
         for wdg in self._basic_cards:
             wdg.setVisible(basic)
@@ -1664,12 +1765,8 @@ class MainWindow(QMainWindow):
         it.setData(Qt.UserRole, tn if tn is not None else rid)
         it.setData(Qt.UserRole + 1, rec.get("results") or [])
         it.setData(Qt.UserRole + 2, rid)
-        it.setToolTip(
-            f"提示词: {prompt}\n"
-            f"负面: {rec.get('negative_prompt', '')}\n"
-            f"模型: {rec.get('model', '')}｜尺寸: {rec.get('size', '')}\n"
-            f"参考图: {len(rec.get('refs') or [])} 张｜产物: "
-            f"{len(rec.get('results') or [])} 个\n双击=载入该任务设置复用修改")
+        # 不设原生 tooltip：悬停信息由 _on_queue_hover 的卡片统一展示
+        # （原生 tooltip 会与悬停卡片重叠成两个浮窗）
         self.lst_queue.insertItem(0, it)
         return it
 
@@ -1712,6 +1809,12 @@ class MainWindow(QMainWindow):
             self.cmb_gpt_model.setCurrentText(rec["model"])
         if rec.get("size"):
             self.cmb_gpt_size.setCurrentText(rec["size"])
+        if rec.get("quality"):
+            self.cmb_gpt_quality.setCurrentText(
+                {"low": "low（快速）", "high": "high（精细）"}.get(
+                    rec["quality"], "medium（标准）"))
+        if "oversea" in rec:
+            self.chk_gpt_oversea.setChecked(bool(rec.get("oversea")))
         refs = [p for p in (rec.get("refs") or []) if Path(p).is_file()]
         if refs:
             self._basic_ref_paths = refs[:9]
@@ -1732,6 +1835,7 @@ class MainWindow(QMainWindow):
         n_res = len(rec.get("results") or [])
         menu = QMenu(self)
         act_load = menu.addAction("📥 载入该任务设置（复用修改）")
+        act_retry = menu.addAction("↻ 重跑该任务（复用相同设置立即生成）")
         act_prompt = menu.addAction("📋 导入该图提示词")
         menu.addSeparator()
         act_preview = menu.addAction("🔍 在预览中打开产物")
@@ -1743,6 +1847,8 @@ class MainWindow(QMainWindow):
         chosen = menu.exec(self.lst_queue.mapToGlobal(pos))
         if chosen == act_load:
             self._queue_load_settings()
+        elif chosen == act_retry:
+            self._queue_retry(rec)
         elif chosen == act_prompt:
             self._queue_import_prompt(rec)
         elif chosen == act_preview:
@@ -1755,6 +1861,21 @@ class MainWindow(QMainWindow):
             self._queue_delete(it, purge=False)
         elif chosen == act_purge:
             self._queue_delete(it, purge=True)
+
+    def _queue_retry(self, rec: dict) -> None:
+        """↻ 重跑：载入该任务设置后，用完全相同参数立即重新提交生成。"""
+        if not rec:
+            self.log("重跑失败：该队列条目没有可复用的记录")
+            return
+        tid = rec.get("id")
+        local = rec.get("engine", "GPT") == "本地"
+        if not local and not self.ed_gpt_key.text().strip():
+            self.log("已载入设置，但云端 API Key 为空——"
+                     "请在设置里填写 API Key 后再点「生成」")
+            return
+        self._queue_load_settings()     # 回填提示词/模型/尺寸/参考图/引擎
+        self.log(f"↻ 已载入任务 #{tid} 的设置，正在以相同参数重新提交…")
+        self.on_generate()
 
     def _queue_import_prompt(self, rec: dict) -> None:
         if not rec.get("prompt"):
@@ -1922,6 +2043,11 @@ class MainWindow(QMainWindow):
         self.lst_queue.customContextMenuRequested.connect(self._queue_menu)
         self.lst_queue.itemDoubleClicked.connect(
             lambda _: self._queue_load_settings())
+        # 悬停浮窗：预览该任务的参考图/产物/提示词
+        self.lst_queue.setMouseTracking(True)
+        self.lst_queue.itemEntered.connect(self._on_queue_hover)
+        self.lst_queue.viewport()._pf_hide_hover = True
+        self.lst_queue.viewport().installEventFilter(self)
         lay_log.addWidget(self.lst_queue, 1)
         self.txt_log = QPlainTextEdit()
         self.txt_log.setObjectName("logView")
@@ -2063,6 +2189,12 @@ class MainWindow(QMainWindow):
         s.gpt_api_key = self.ed_gpt_key.text().strip()
         s.gpt_model = self.cmb_gpt_model.currentText().strip()
         s.gpt_size = self.cmb_gpt_size.currentText()
+        s.gpt_quality = self.cmb_gpt_quality.currentText().split("（")[0]
+        s.gpt_oversea = self.chk_gpt_oversea.isChecked()
+        s.gpt_background = (
+            "transparent" if "transparent" in self.cmb_gpt_bg.currentText()
+            else "opaque" if "opaque" in self.cmb_gpt_bg.currentText()
+            else "auto")
         s.checkpoint = self.cmb_ckpt.currentText()
         s.prompt = self.ed_prompt.toPlainText().strip()
         s.negative_prompt = self.ed_negative.toPlainText().strip()
@@ -2098,6 +2230,12 @@ class MainWindow(QMainWindow):
         self.ed_gpt_key.setText(s.gpt_api_key)
         self.cmb_gpt_model.setCurrentText(s.gpt_model)
         self.cmb_gpt_size.setCurrentText(s.gpt_size)
+        self.cmb_gpt_quality.setCurrentText(
+            {"low": "low（快速）", "high": "high（精细）"}.get(
+                s.gpt_quality, "medium（标准）"))
+        self.chk_gpt_oversea.setChecked(bool(s.gpt_oversea))
+        self.cmb_gpt_bg.setCurrentIndex(
+            {"transparent": 2, "opaque": 1}.get(s.gpt_background, 0))
         self._basic_res_pick(s.gpt_size)
         self.cmb_ui_mode.setCurrentIndex(max(0, min(2, int(s.ui_mode))))
         self.ed_prompt.setPlainText(s.prompt)
@@ -2480,6 +2618,8 @@ class MainWindow(QMainWindow):
             "negative_prompt": s.negative_prompt,
             "model": s.gpt_model,
             "size": s.gpt_size,
+            "quality": s.gpt_quality,
+            "oversea": bool(s.gpt_oversea),
             "refs": [str(p) for p in refs],
             "results": [],
         }
@@ -2751,6 +2891,14 @@ class MainWindow(QMainWindow):
         if n > 9:
             self.log(f"[笨蛋模式] 参考图超过 9 张，仅使用前 9 张")
 
+    def eventFilter(self, obj, event) -> bool:
+        """悬停预览：鼠标离开列表/下拉视口时收起浮窗。"""
+        from PySide6.QtCore import QEvent
+        if event.type() == QEvent.Leave and \
+                getattr(obj, "_pf_hide_hover", False):
+            self._hide_hover_preview()
+        return super().eventFilter(obj, event)
+
     def _show_hover_preview(self, path: str, gpos) -> None:
         """悬停浮窗：跟随光标的大图预览（最大 380px）。"""
         self._hide_hover_preview()
@@ -2777,6 +2925,164 @@ class MainWindow(QMainWindow):
         if self._hover_preview is not None:
             self._hover_preview.deleteLater()
             self._hover_preview = None
+
+    # ---- 悬停卡片：历史快照 / 队列项（参考图 + 生成图 + 提示词）----
+
+    @staticmethod
+    def _make_strip(paths: list, height: int = 110,
+                    max_n: int = 6) -> QPixmap | None:
+        """多张图等高拼成一条缩略图带（最多 max_n 张，超额加 +n 尾块）。"""
+        valid = [str(p) for p in paths if p and Path(p).is_file()]
+        if not valid:
+            return None
+        pixmaps = []
+        for p in valid[:max_n]:
+            pm = QPixmap(p)
+            if pm.isNull():
+                continue
+            pixmaps.append(pm.scaledToHeight(
+                height, Qt.SmoothTransformation))
+        if not pixmaps:
+            return None
+        gap = 4
+        tail = max(0, len(valid) - max_n)
+        total_w = sum(pm.width() for pm in pixmaps) + gap * (len(pixmaps) - 1)
+        if tail:
+            tail_pm = QPixmap(height, height)
+            tail_pm.fill(Qt.transparent)
+            pt = QPainter(tail_pm)
+            pt.setPen(Qt.white)
+            f = pt.font()
+            f.setPointSize(14)
+            pt.setFont(f)
+            pt.drawText(tail_pm.rect(), Qt.AlignCenter, f"+{tail}")
+            pt.end()
+            total_w += gap + height
+        out = QPixmap(max(1, total_w), height)
+        out.fill(Qt.transparent)
+        pt = QPainter(out)
+        x = 0
+        for pm in pixmaps:
+            pt.drawPixmap(x, 0, pm)
+            x += pm.width() + gap
+        if tail:
+            pt.drawPixmap(x, 0, tail_pm)
+        pt.end()
+        return out
+
+    def _show_hover_card(self, refs: list, results: list, text: str,
+                         gpos, meta: str = "") -> None:
+        """悬停卡片：参考图带 + 生成图带 + 提示词 + 参数说明。"""
+        from PySide6.QtWidgets import QVBoxLayout as _QV
+        strip_r = self._make_strip(refs)
+        strip_o = self._make_strip(results)
+        text = (text or "").strip()
+        meta = (meta or "").strip()
+        if strip_r is None and strip_o is None and not text and not meta:
+            return
+        self._hide_hover_preview()
+        card = QWidget(self, Qt.ToolTip)
+        card.setObjectName("hoverPreview")
+        lay = _QV(card)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
+        if strip_r is not None:
+            lbl = QLabel("参考图")
+            lbl.setObjectName("sectionLabel")
+            lay.addWidget(lbl)
+            iv = QLabel()
+            iv.setPixmap(strip_r)
+            lay.addWidget(iv)
+        if strip_o is not None:
+            lbl = QLabel("生成图")
+            lbl.setObjectName("sectionLabel")
+            lay.addWidget(lbl)
+            iv = QLabel()
+            iv.setPixmap(strip_o)
+            lay.addWidget(iv)
+        if text:
+            tl = QLabel(text if len(text) <= 400 else text[:400] + "…")
+            tl.setWordWrap(True)
+            tl.setMaximumWidth(380)
+            lay.addWidget(tl)
+        if meta:
+            ml = QLabel(meta)
+            ml.setObjectName("dimTip")
+            ml.setWordWrap(True)
+            ml.setMaximumWidth(380)
+            lay.addWidget(ml)
+        card.adjustSize()
+        x = gpos.x() + 18
+        y = gpos.y() + 18
+        screen = self.screen().geometry()
+        if x + card.width() > screen.right():
+            x = gpos.x() - card.width() - 10
+        if y + card.height() > screen.bottom():
+            y = gpos.y() - card.height() - 10
+        card.move(max(screen.left(), x), max(screen.top(), y))
+        card.show()
+        self._hover_preview = card
+
+    def _on_history_hover(self, idx: int) -> None:
+        """历史快照下拉悬停：浮窗预览参考图/生成图/提示词。"""
+        if hasattr(idx, "row"):        # 直接接到 QModelIndex 信号也兼容
+            idx = idx.row()
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            self._hide_hover_preview()
+            return
+        history = load_gen_history()
+        if not (0 <= idx < len(history)):
+            self._hide_hover_preview()
+            return
+        snap = history[idx]
+        refs = [snap.get("ref_image", "")] if snap.get("ref_image") else []
+        results = snap.get("result_paths") or []
+        text = snap.get("prompt", "")
+        meta = "\n".join(filter(None, [
+            f"时间 {snap.get('time', '')}｜" +
+            ("云端 GPT" if snap.get("gpt_engine") else "本地 ComfyUI"),
+            f"模型 {snap.get('gpt_model', '') or snap.get('checkpoint', '')}"
+            f"｜尺寸 {snap.get('gpt_size', '') or str(snap.get('width', ''))}"
+            f"x{snap.get('height', '')}",
+            f"步数 {snap.get('steps', '')}｜CFG {snap.get('cfg', '')}"
+            f"｜种子 {snap.get('seed', '')}",
+            f"负面: {snap.get('negative_prompt', '')[:120]}"
+            if snap.get("negative_prompt") else "",
+            "双击/加载 = 恢复该次生成的完整设置",
+        ]))
+        self._show_hover_card(refs, results, text, QCursor.pos(), meta=meta)
+
+    def _on_queue_hover(self, it) -> None:
+        """队列项悬停：浮窗预览参考图/产物/提示词。"""
+        rec = self._queue_record_of(it) or {}
+        refs = rec.get("refs") or []
+        results = rec.get("results") or (it.data(Qt.UserRole + 1) or [])
+        text = rec.get("prompt") or ""
+        if not refs and not results and not text:
+            self._hide_hover_preview()
+            return
+        marks = {"done": "已完成", "failed": "失败", "stopped": "已停止",
+                 "running": "进行中"}
+        if rec:
+            meta = "\n".join(filter(None, [
+                f"#{rec.get('id')} ｜ {marks.get(rec.get('status', ''), '')}"
+                f" ｜ {rec.get('time', '')} ｜ "
+                f"{'云端 GPT' if rec.get('engine', 'GPT') != '本地' else '本地 ComfyUI'}",
+                f"模型 {rec.get('model', '')}｜尺寸 {rec.get('size', '')}"
+                + (f"｜画质 {rec.get('quality', '')}"
+                   if rec.get("quality") else ""),
+                f"参考图 {len(refs)} 张｜产物 {len(results)} 个",
+                f"负面: {rec.get('negative_prompt', '')[:120]}"
+                if rec.get("negative_prompt") else "",
+                f"错误: {str(rec.get('error', ''))[:120]}"
+                if rec.get("error") else "",
+                "双击=载入该任务设置｜右键=复用/删除",
+            ]))
+        else:   # 无持久化记录（本会话旧条目）：至少给双击提示
+            meta = "双击=载入该任务设置｜右键=复用/删除"
+        self._show_hover_card(refs, results, text, QCursor.pos(), meta=meta)
 
     def on_generate(self) -> None:
         s = self._collect_settings()
