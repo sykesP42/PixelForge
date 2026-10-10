@@ -308,6 +308,8 @@ class _View(QGraphicsView):
         self.owner._mouse_pos = e.position()
         self.owner._mouse_inside = True
         self.owner.minimap.update()
+        if self.owner._loupe:
+            self.viewport().update()   # 放大镜实时跟随鼠标
         super().mouseMoveEvent(e)
 
     def leaveEvent(self, e) -> None:
