@@ -1738,12 +1738,16 @@ class MainWindow(QMainWindow):
         from pixelforge.config import load_gen_queue, save_gen_queue
         recs = load_gen_queue()
         changed = False
+        self._qf_suspend = True          # 批量恢复时暂停逐条过滤，最后统一刷一次
         for rec in reversed(recs):          # 最新在前插入
             if rec.get("status") == "running":   # 上次会话未结束（崩溃/强退）
                 rec["status"] = "stopped"
                 rec.setdefault("error", "上次会话未结束（程序退出）")
                 changed = True
             self._queue_add_item(rec)
+        self._qf_suspend = False
+        if hasattr(self, "cmb_qfilter"):
+            self._apply_queue_filter()
         if changed:
             save_gen_queue(recs)
         if recs:
@@ -1768,6 +1772,9 @@ class MainWindow(QMainWindow):
         # 不设原生 tooltip：悬停信息由 _on_queue_hover 的卡片统一展示
         # （原生 tooltip 会与悬停卡片重叠成两个浮窗）
         self.lst_queue.insertItem(0, it)
+        if hasattr(self, "cmb_qfilter") and not getattr(
+                self, "_qf_suspend", False):
+            self._apply_queue_filter()
         return it
 
     def _queue_id_of(self, it) -> object:
@@ -1795,7 +1802,60 @@ class MainWindow(QMainWindow):
                 recs[i].update(fields)
                 recs[i]["id"] = qid
                 save_gen_queue(recs)
-                return
+                break
+        if hasattr(self, "cmb_qfilter"):
+            self._apply_queue_filter()
+
+    @staticmethod
+    def _fuzzy_hit(text: str, query: str) -> bool:
+        """模糊匹配：query 空白分词，每词需为子串或顺序子序列命中。"""
+        if not query:
+            return True
+        t = text.lower()
+        for tok in query.lower().split():
+            if tok in t:
+                continue
+            i = 0
+            for ch in t:
+                if i < len(tok) and ch == tok[i]:
+                    i += 1
+                    if i == len(tok):
+                        break
+            if i < len(tok):
+                return False
+        return True
+
+    def _apply_queue_filter(self) -> None:
+        """按状态下拉 + 关键词过滤队列列表（隐藏不匹配项，不删数据）。"""
+        if not hasattr(self, "cmb_qfilter"):
+            return
+        from pixelforge.config import load_gen_queue
+        status_map = {"进行中": "running", "已完成": "done",
+                      "失败": "failed", "已停止": "stopped"}
+        want = status_map.get(self.cmb_qfilter.currentText())
+        query = self.ed_qsearch.text().strip()
+        recs = {r.get("id"): r for r in load_gen_queue()}
+        total = self.lst_queue.count()
+        shown = 0
+        for i in range(total):
+            it = self.lst_queue.item(i)
+            rec = recs.get(self._queue_id_of(it)) or {}
+            ok = True
+            if want and rec.get("status", "running") != want:
+                ok = False
+            if ok and query:
+                hay = " ".join([
+                    str(rec.get("prompt", "")), str(rec.get("negative_prompt", "")),
+                    str(rec.get("model", "")), str(rec.get("size", "")),
+                    str(rec.get("engine", "")), str(rec.get("status", "")),
+                    str(rec.get("error", "")), it.text(),
+                ])
+                if not self._fuzzy_hit(hay, query):
+                    ok = False
+            it.setHidden(not ok)
+            shown += 1 if ok else 0
+        if hasattr(self, "lbl_qcount"):
+            self.lbl_qcount.setText(f"显示 {shown} / 共 {total}")
 
     def _queue_load_settings(self) -> None:
         """双击队列项：把该历史任务的提示词/模型/尺寸等载入界面复用。"""
@@ -2037,6 +2097,26 @@ class MainWindow(QMainWindow):
         w_log = QWidget()
         lay_log = QVBoxLayout(w_log)
         lay_log.setContentsMargins(4, 4, 4, 4)
+        # 队列筛选栏：状态下拉 + 关键词模糊过滤
+        row_qf = QHBoxLayout()
+        row_qf.addWidget(QLabel("筛选"))
+        self.cmb_qfilter = QComboBox()
+        self.cmb_qfilter.addItems(["全部", "进行中", "已完成", "失败", "已停止"])
+        self.cmb_qfilter.setToolTip("按任务状态过滤队列")
+        self.cmb_qfilter.currentIndexChanged.connect(
+            lambda _: self._apply_queue_filter())
+        row_qf.addWidget(self.cmb_qfilter)
+        self.ed_qsearch = QLineEdit()
+        self.ed_qsearch.setPlaceholderText("🔍 过滤队列（提示词/模型/引擎，空格分词）")
+        self.ed_qsearch.setClearButtonEnabled(True)
+        self.ed_qsearch.setToolTip("模糊过滤：多个关键词用空格分隔，需全部命中")
+        self.ed_qsearch.textChanged.connect(
+            lambda _: self._apply_queue_filter())
+        row_qf.addWidget(self.ed_qsearch, 1)
+        self.lbl_qcount = QLabel("")
+        self.lbl_qcount.setStyleSheet("color:#8a8f98; font-size:11px;")
+        row_qf.addWidget(self.lbl_qcount)
+        lay_log.addLayout(row_qf)
         self.lst_queue = QListWidget()
         self.lst_queue.setObjectName("queueList")
         self.lst_queue.setContextMenuPolicy(Qt.CustomContextMenu)

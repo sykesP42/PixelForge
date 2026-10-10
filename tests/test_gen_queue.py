@@ -138,6 +138,36 @@ def main() -> int:
                      .splitlines() if x.strip()]
         assert len(log_lines) == 1 and png2.name in log_lines[0]
         print("[OK] 6. 永久删除：文件/队列/画廊/资产库全清 + 删除日志留存")
+
+        # ---------- 7. 队列筛选：状态 + 关键词模糊过滤 ----------
+        n = win.lst_queue.count()
+        assert n == 2, f"筛选用例前置应为 2 条: {n}"
+        win.cmb_qfilter.setCurrentText("全部")
+        win.ed_qsearch.setText("")
+        assert all(not win.lst_queue.item(i).isHidden() for i in range(n))
+        # 状态过滤：失败 -> 只剩 a1
+        win.cmb_qfilter.setCurrentText("失败")
+        vis = [win.lst_queue.item(i).isHidden() for i in range(n)]
+        assert vis.count(False) == 1, f"失败状态应只剩 1 项可见: {vis}"
+        # 关键词：knight 命中 a1
+        win.cmb_qfilter.setCurrentText("全部")
+        win.ed_qsearch.setText("knight")
+        vis = [win.lst_queue.item(i).isHidden() for i in range(n)]
+        assert vis.count(False) == 1, f"knight 应命中 1 项: {vis}"
+        # 顺序子序列：knigt -> knight
+        win.ed_qsearch.setText("knigt")
+        vis = [win.lst_queue.item(i).isHidden() for i in range(n)]
+        assert vis.count(False) == 1, "子序列应命中 knight"
+        # 无命中
+        win.ed_qsearch.setText("zzz")
+        vis = [win.lst_queue.item(i).isHidden() for i in range(n)]
+        assert vis.count(False) == 0
+        # 清空复原 + 计数标签
+        win.ed_qsearch.setText("")
+        win.cmb_qfilter.setCurrentText("全部")
+        assert all(not win.lst_queue.item(i).isHidden() for i in range(n))
+        assert "2 / 共 2" in win.lbl_qcount.text(), win.lbl_qcount.text()
+        print("[OK] 7. 队列筛选：状态过滤 + 关键词模糊 + 计数标签")
         win.close()
     finally:
         cfgmod.CONFIG_FILE, cfgmod.GEN_QUEUE_FILE = old_cfg, old_q
