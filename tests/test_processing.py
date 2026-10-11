@@ -221,6 +221,25 @@ def main() -> int:
             pass
     print("[OK] waifu2x: 非法倍率/降噪等级报错")
 
+    # ---- GPU/CPU 设备选择 ----
+    assert w2x.resolve_device("cpu") == "cpu"
+    assert w2x.resolve_device("auto") in ("cpu", "cuda")
+    has_gpu = w2x.gpu_available()
+    if has_gpu:
+        assert w2x.resolve_device("gpu") == "cuda"
+        out_g = w2x.upscale(px, scale=2, noise_level=1, device="gpu")
+        out_c = w2x.upscale(px, scale=2, noise_level=1, device="cpu")
+        d = np.abs(out_g.astype(int) - out_c.astype(int)).max()
+        assert d <= 1, f"GPU 与 CPU 结果差应 ≤1/255: {d}"
+        print(f"[OK] waifu2x: GPU(torch CUDA) 与 CPU 结果一致（最大差 {d}/255）")
+    else:
+        try:
+            w2x.upscale(px, scale=2, noise_level=1, device="gpu")
+            raise AssertionError("无 GPU 时 device=gpu 应报错")
+        except w2x.Waifu2xError:
+            pass
+        print("[OK] waifu2x: 无 GPU 时显式 gpu 请求给出清晰报错")
+
     print("\n阶段2 全部测试通过 ✔")
     return 0
 

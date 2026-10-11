@@ -10,7 +10,7 @@ from PySide6.QtCore import QThread, Signal
 
 from pixelforge.processing import waifu2x
 
-# 单图上限（像素总数）：纯 CPU 推理，2M 像素约需 1~3 分钟
+# 单图上限（像素总数）：CPU 推理 2M 像素约 1~3 分钟；GPU 加速快数倍
 MAX_INPUT_PIXELS = 2_000_000
 
 
@@ -25,12 +25,14 @@ class Waifu2xWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, src, scale: int = 2, noise_level: int = -1,
-                 out_dir: str | None = None, parent=None):
+                 out_dir: str | None = None, device: str = "auto",
+                 parent=None):
         super().__init__(parent)
         self._src = src
         self._scale = scale
         self._noise = noise_level
         self._out_dir = out_dir
+        self._device = device
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -58,6 +60,7 @@ class Waifu2xWorker(QThread):
                 return
             out = waifu2x.upscale(
                 img, scale=self._scale, noise_level=self._noise,
+                device=self._device,
                 progress=lambda v: self.progress.emit(min(0.99, float(v))))
             if self._cancelled:
                 return

@@ -52,6 +52,7 @@ from pixelforge.processing.macro import (
     save_macro,
 )
 from pixelforge.ui.w2x_worker import Waifu2xWorker
+from pixelforge.processing.waifu2x import gpu_available as _w2x_gpu_available
 
 
 def _to_pixmap(arr: np.ndarray) -> QPixmap:
@@ -680,10 +681,20 @@ class ImageLab(QWidget):
             ["不降噪", "0（几乎无）", "1（轻）", "2（中）", "3（强）"])
         self.cmb_w2x_noise.setCurrentIndex(2)
         row_w2x.addWidget(self.cmb_w2x_noise, 1)
+        row_w2x.addWidget(QLabel("计算"))
+        self.cmb_w2x_device = QComboBox()
+        self.cmb_w2x_device.addItems(["自动", "GPU", "CPU"])
+        self.cmb_w2x_device.setToolTip(
+            "GPU：torch CUDA 加速（快数倍，需环境装了 torch）\n"
+            "CPU：numpy 推理（无 torch 也能跑）\n自动：有 GPU 用 GPU，否则 CPU")
+        if not _w2x_gpu_available():
+            self.cmb_w2x_device.setItemData(
+                1, "当前环境未检测到可用 GPU（torch+CUDA）", Qt.ToolTipRole)
+        row_w2x.addWidget(self.cmb_w2x_device)
         wl.addLayout(row_w2x)
         self.btn_w2x = QPushButton("✨ waifu2x 放大当前图")
         self.btn_w2x.setToolTip(
-            "UpConv7 模型随包分发，纯 CPU 推理；2x 约数秒~数十秒（视图大小），\n"
+            "UpConv7 模型随包分发；GPU 加速（自动启用，快数倍）或 CPU 推理，\n"
             "建议 ≤ 200 万像素。像素画/动漫线稿效果最佳")
         self.btn_w2x.clicked.connect(self.run_waifu2x)
         wl.addWidget(self.btn_w2x)
@@ -1618,13 +1629,16 @@ class ImageLab(QWidget):
             return
         scale = 2 if self.cmb_w2x_scale.currentIndex() == 0 else 4
         noise = self.cmb_w2x_noise.currentIndex() - 1   # 0 -> -1（不降噪）
+        device = ("auto", "gpu", "cpu")[self.cmb_w2x_device.currentIndex()]
         self.btn_w2x.setEnabled(False)
         self.btn_w2x.setText("✨ waifu2x 处理中 0%…")
         h, w = self.arr.shape[:2]
+        dev_txt = {"auto": "自动设备", "gpu": "GPU 加速", "cpu": "CPU"}[device]
         self.state_changed.emit(
-            f"waifu2x：{w}x{h} → {w * scale}x{h * scale}，CPU 推理中…")
+            f"waifu2x：{w}x{h} → {w * scale}x{h * scale}，{dev_txt}推理中…")
         self._w2x_worker = Waifu2xWorker(
             self.arr.copy(), scale=scale, noise_level=noise,
+            device=device,
             out_dir=str(self.path.parent) if self.path else None)
         self._w2x_worker.progress.connect(self._on_w2x_progress)
         self._w2x_worker.done.connect(self._on_w2x_done)

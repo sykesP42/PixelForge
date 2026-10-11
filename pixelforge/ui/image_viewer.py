@@ -138,10 +138,16 @@ class ProImageViewer(QWidget):
             ["不降噪", "降噪 0", "降噪 1", "降噪 2", "降噪 3"])
         self.cmb_w2x_noise.setCurrentIndex(3)
         self.cmb_w2x_noise.setFixedHeight(24)
+        self.cmb_w2x_device = QComboBox()
+        self.cmb_w2x_device.addItems(["自动", "GPU", "CPU"])
+        self.cmb_w2x_device.setFixedHeight(24)
+        self.cmb_w2x_device.setToolTip(
+            "GPU：torch CUDA 加速（快数倍）；CPU：numpy 推理；\n"
+            "自动：有 GPU 用 GPU，否则 CPU")
         self.btn_w2x = QPushButton("✨ waifu2x")
         self.btn_w2x.setFixedHeight(24)
         self.btn_w2x.setToolTip(
-            "AI 超分辨率（UpConv7 模型随包分发，纯 CPU 推理）：\n"
+            "AI 超分辨率（UpConv7 模型随包分发，GPU 加速/CPU 推理）：\n"
             "对当前图片放大 2x/4x，可选降噪等级；完成后自动打开结果图")
         self.btn_w2x.clicked.connect(self.run_waifu2x)
         row = QWidget()
@@ -156,6 +162,7 @@ class ProImageViewer(QWidget):
         brow.addWidget(QLabel("AI 放大"))
         brow.addWidget(self.cmb_w2x_scale)
         brow.addWidget(self.cmb_w2x_noise)
+        brow.addWidget(self.cmb_w2x_device)
         brow.addWidget(self.btn_w2x)
         rl.addLayout(brow)
         rl.addWidget(self.view, 1)
@@ -211,13 +218,15 @@ class ProImageViewer(QWidget):
             return
         scale = 2 if self.cmb_w2x_scale.currentIndex() == 0 else 4
         noise = self.cmb_w2x_noise.currentIndex() - 1   # 0 -> -1（不降噪）
+        device = ("auto", "gpu", "cpu")[self.cmb_w2x_device.currentIndex()]
         self.btn_w2x.setEnabled(False)
         self.btn_w2x.setText("✨ 0%…")
         w, h = self._pm.width(), self._pm.height()
+        dev_txt = {"auto": "自动设备", "gpu": "GPU 加速", "cpu": "CPU"}[device]
         self.state_message.emit(
-            f"waifu2x：{w}x{h} → {w * scale}x{h * scale}，CPU 推理中…")
+            f"waifu2x：{w}x{h} → {w * scale}x{h * scale}，{dev_txt}推理中…")
         self._w2x_worker = Waifu2xWorker(self._path, scale=scale,
-                                         noise_level=noise)
+                                         noise_level=noise, device=device)
         self._w2x_worker.progress.connect(self._on_w2x_progress)
         self._w2x_worker.done.connect(self._on_w2x_done)
         self._w2x_worker.failed.connect(self._on_w2x_failed)

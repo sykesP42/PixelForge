@@ -1,4 +1,4 @@
-"""waifu2x 超分辨率（UpConv7 架构，纯 numpy/cv2 推理，不依赖深度学习框架）。
+"""waifu2x 超分辨率（UpConv7 架构）：CPU = numpy/cv2 推理，GPU = torch CUDA。
 
 权重来源：PyPI 包 waifu2x（FHPythonUtils/Waifu2x，MIT）内嵌的
 models/upconv7/anime_style_*_rgb.npz —— 源自 nagadomi/waifu2x 与
@@ -10,6 +10,7 @@ tsurumeso/waifu2x-chainer（均为 MIT）。随包分发于 pixelforge/models/wa
     整网: in -> (in - 12) -> 2*(in - 12) - 4 = 2*in - 28
 因此输入四周以 edge 模式填充 7px 后，输出恰为 2 倍尺寸，无需再裁剪。
 上游 blockwise 分块与整图推理在内部区域完全等价，这里按块推理以限制内存。
+GPU 路径权重一次性上卡，块间切片不出卡（显存占用 ~几十 MB/块）。
 """
 from __future__ import annotations
 
@@ -37,6 +38,34 @@ def available_models() -> list[str]:
     if not MODELS_DIR.is_dir():
         return []
     return sorted(p.name for p in MODELS_DIR.glob("*.npz"))
+
+
+# ---- 设备选择：CPU = numpy/BLAS 路径；GPU = torch CUDA 路径 ----
+
+def gpu_available() -> bool:
+    """当前环境是否具备 GPU 加速（torch + CUDA）。"""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001  未装 torch / CUDA 驱动缺失
+        return False
+
+
+def resolve_device(device: str = "auto") -> str:
+    """归一化设备选择：auto/gpu/cpu -> "cpu" | "cuda"。
+
+    auto：有可用 GPU 则用 GPU，否则回退 CPU；显式 gpu 不可用时直接报错。
+    """
+    d = (device or "auto").lower()
+    if d == "cpu":
+        return "cpu"
+    if d == "gpu":
+        if not gpu_available():
+            raise Waifu2xError(
+                "GPU 加速不可用：当前 Python 环境缺少 torch(CUDA)\n"
+                "（可改用 CPU 模式，或安装与显卡匹配的 torch）")
+        return "cuda"
+    return "cuda" if gpu_available() else "cpu"
 
 
 def _model_file(noise_level: int) -> Path:
@@ -140,6 +169,58 @@ def _blockwise(rgb01: np.ndarray, w: dict[str, np.ndarray],
     return dst[:, :hh * 2, :ww * 2].transpose(1, 2, 0)
 
 
+def _forward_block_torch(x, wt):
+    """torch 版单块前向：x (1,3,in,in) 0..1 -> (1,3,block,block)。
+
+    torch Conv2d 权重 (out,in,kh,kw) 与 npz conv W 一致；
+    ConvTranspose2d 权重 (in,out,kh,kw) 与 chainer Deconv W 一致（无需转置）。
+    """
+    import torch.nn.functional as F
+    h = x
+    for i in range(1, 7):
+        h = F.conv2d(h, wt[f"conv{i}/W"], wt[f"conv{i}/b"])
+        h = F.leaky_relu(h, 0.1)
+    return F.conv_transpose2d(h, wt["conv7/W"], stride=2, padding=3)
+
+
+def _blockwise_torch(rgb01: np.ndarray, w: dict[str, np.ndarray],
+                     device: str, progress=None,
+                     tile_inner: int = _TILE_INNER) -> np.ndarray:
+    """GPU 分块推理：权重一次性上卡，块间切片不出卡（RGB 通道输入 H,W,3）。"""
+    import torch
+    wt = {k: torch.from_numpy(v).to(device) for k, v in w.items()}
+    hh, ww, _ = rgb01.shape
+    in_off = 7
+    in_block = tile_inner + in_off * 2
+
+    def _pad(size: int) -> int:
+        return in_off if size % tile_inner == 0 else \
+            tile_inner - size % tile_inner + in_off
+
+    psrc = torch.from_numpy(np.pad(
+        rgb01.transpose(2, 0, 1),
+        ((0, 0), (in_off, _pad(hh)), (in_off, _pad(ww))), "edge"))
+    psrc = psrc.to(device).unsqueeze(0)          # (1,3,PH,PW)
+    nh = (psrc.shape[2] - in_off * 2) // tile_inner
+    nw = (psrc.shape[3] - in_off * 2) // tile_inner
+    total = nh * nw
+    done = 0
+    outs = []
+    for i in range(nh):
+        ih = i * tile_inner
+        row = []
+        for j in range(nw):
+            jw = j * tile_inner
+            tile = psrc[:, :, ih:ih + in_block, jw:jw + in_block]
+            row.append(_forward_block_torch(tile, wt))
+            done += 1
+            if progress:
+                progress(done / total)
+        outs.append(torch.cat(row, dim=3))
+    dst = torch.cat(outs, dim=2)
+    return dst[0, :, :hh * 2, :ww * 2].permute(1, 2, 0).cpu().numpy()
+
+
 def _fill_transparent(bgra: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """把透明区的杂色向不透明色内扩（防网络把杂色晕染进可见边缘）。
 
@@ -162,7 +243,7 @@ def _upscale_alpha(a: np.ndarray, scale: int) -> np.ndarray:
 
 
 def upscale(bgra: np.ndarray, scale: int = 2, noise_level: int = -1,
-            progress=None) -> np.ndarray:
+            progress=None, device: str = "auto") -> np.ndarray:
     """waifu2x 放大 BGRA 图。
 
     参数
@@ -171,6 +252,7 @@ def upscale(bgra: np.ndarray, scale: int = 2, noise_level: int = -1,
     scale       : 2 或 4（4 = 连跑两次 2x）
     noise_level : -1 不降噪 / 0~3 降噪强度（对应不同权重文件）
     progress    : 可选回调 fn(0..1)，跨多次 2x 累计
+    device      : "auto"（有 GPU 用 GPU）/ "gpu" / "cpu"
 
     返回 BGRA uint8，尺寸为 (H*scale, W*scale)。
     """
@@ -183,6 +265,7 @@ def upscale(bgra: np.ndarray, scale: int = 2, noise_level: int = -1,
     elif bgra.shape[2] == 3:
         bgra = cv2.cvtColor(bgra, cv2.COLOR_BGR2BGRA)
 
+    dev = resolve_device(device)
     w = _load_weights(_model_file(noise_level))
     rgb, a = _fill_transparent(bgra)
     passes = scale // 2
@@ -194,7 +277,11 @@ def upscale(bgra: np.ndarray, scale: int = 2, noise_level: int = -1,
             if progress:
                 progress((base + v / passes))
 
-        out_rgb = np.clip(_blockwise(out_rgb, w, cb), 0.0, 1.0)
+        if dev == "cuda":
+            out_rgb = np.clip(
+                _blockwise_torch(out_rgb, w, dev, cb), 0.0, 1.0)
+        else:
+            out_rgb = np.clip(_blockwise(out_rgb, w, cb), 0.0, 1.0)
         out_a = _upscale_alpha(out_a, 2)
     out = np.empty((*out_a.shape, 4), np.uint8)
     out[:, :, :3] = np.clip(out_rgb * 255.0 + 0.5, 0, 255).astype(np.uint8)
