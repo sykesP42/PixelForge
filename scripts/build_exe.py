@@ -23,6 +23,11 @@ def main() -> int:
         "--noconfirm", "--clean",
         "--windowed",
         "--name", "PixelForgeStudio",
+        # torch 仅供 GPU 模式可选安装（约 2.5GB）；打包版走 CPU 兜底，
+        # waifu2x.resolve_device 检测不到 torch 会自动回退/明确报错
+        "--exclude-module", "torch",
+        "--exclude-module", "torchvision",
+        "--exclude-module", "torchaudio",
         "--add-data", f"{workflows};pixelforge/workflows",
         "--add-data", f"{models};pixelforge/models",
         "--distpath", str(ROOT / "dist"),
