@@ -332,6 +332,55 @@ def main() -> int:
     assert [list(c) for c in lab._locked_palette] == pal_before, "取消不应修改调色板"
     print("[OK] 调色板吸取: 纯函数平色/四色提取 + 入口锁定 + 取消保护")
 
+    # 20. 手动裁切编辑器：数值面板 / 比例锁定 / 键盘微调 / 收缩到内容
+    from PySide6.QtGui import QKeyEvent
+    assert hasattr(lab, "sp_cx") and hasattr(lab, "cmb_cratio") and \
+        hasattr(lab, "chk_cratio"), "工具坊应有手动裁切数值面板"
+    mc = np.zeros((40, 60, 4), np.uint8)
+    mc[10:30, 20:50] = (0, 0, 255, 255)          # 内容区
+    mcp = TMP / "manual_crop.png"
+    cv2.imwrite(str(mcp), mc)
+    lab.load_path(mcp)
+    assert lab.arr.shape[:2] == (40, 60), lab.arr.shape
+    lab.cmb_brush.setCurrentIndex(3)             # 手动裁切模式
+    assert lab._brush_mode == "crop" and lab._crop_rect is not None
+    # 1) 数值面板 -> 框
+    lab.sp_cx.setValue(5)
+    lab.sp_cy.setValue(7)
+    lab.sp_cw.setValue(20)
+    lab.sp_ch.setValue(12)
+    assert lab._crop_rect == [5, 7, 25, 19], lab._crop_rect
+    # 2) 比例预设 1:1 -> 中心不变变正方形
+    lab.cmb_cratio.setCurrentIndex(1)
+    assert lab._crop_ratio == (1, 1)
+    x0, y0, x1, y1 = lab._crop_rect
+    assert (x1 - x0) == (y1 - y0), f"1:1 应正方形: {lab._crop_rect}"
+    # 3) 键盘微调：右移 1px / Shift+右移 10px / Alt+右 = 宽+1
+    def _key(k, mod=Qt.NoModifier):
+        return QKeyEvent(QEvent.KeyPress, k, mod)
+    before = list(lab._crop_rect)
+    assert lab.eventFilter(lab.canvas, _key(Qt.Key_Right)) is True
+    assert lab._crop_rect[0] == before[0] + 1 and lab._crop_rect[2] == before[2] + 1
+    before = list(lab._crop_rect)
+    lab.eventFilter(lab.canvas, _key(Qt.Key_Right, Qt.ShiftModifier))
+    assert lab._crop_rect[0] == before[0] + 10, "Shift 应 10px 步进"
+    before = list(lab._crop_rect)
+    lab.eventFilter(lab.canvas, _key(Qt.Key_Right, Qt.AltModifier))
+    assert lab._crop_rect[2] - lab._crop_rect[0] == \
+        before[2] - before[0] + 1, "Alt+右 应只加宽"
+    # 4) 收缩到内容：透明边被切掉
+    lab.chk_cratio.setChecked(False)
+    lab.cmb_cratio.setCurrentIndex(0)
+    lab._crop_to_content()
+    assert lab._crop_rect == [20, 10, 50, 30], lab._crop_rect
+    # 5) Enter 应用 + Esc 退出
+    lab.eventFilter(lab.canvas, _key(Qt.Key_Return))
+    assert lab.arr.shape[:2] == (20, 30), f"Enter 应应用裁切: {lab.arr.shape}"
+    lab.cmb_brush.setCurrentIndex(3)
+    lab.eventFilter(lab.canvas, _key(Qt.Key_Escape))
+    assert lab._brush_mode == "browse", "Esc 应退出裁切模式"
+    print("[OK] 手动裁切编辑器: 数值面板/1:1比例/键盘微调/收缩到内容/Enter应用/Esc退出")
+
     print("\n图像工具坊全部测试通过 ✔")
     return 0
 

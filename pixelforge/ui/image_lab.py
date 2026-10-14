@@ -8,7 +8,8 @@
 - 智能单帧：整体内容紧致化输出 1 帧（单角色图不再被网格切碎）
 - 自动裁切双模式：连通域 / 网格切分（行 x 列）
 - 逐帧位移/缩放对话框（FrameAdjustDialog）：入口在动画播放器（裁切后逐帧调位移与缩放，锚点中心/脚底/左上，一键应用/脚底对齐）
-- 自由裁切：画布叠加裁切框，拖四边微调 / 框内整体移动 / 框外拖动新建框
+- 手动裁切编辑器：画布拖框 / 八向手柄 / 数值面板(X,Y,宽,高) / 比例锁定(1:1~16:1 预设)
+  / 键盘微调(方向键 Shift=10px, Alt+方向=调宽高, Enter 应用, Esc 退出) / 收缩到内容 / 三分构图线
 - 放大镜：鼠标位置实时放大预览（可开关），配合裁切线/画笔精确操作
 - 常用编辑：亮度/对比度/饱和度（带数值显示）、旋转90°、水平/垂直翻转、手动裁边
 - 旋转任意角度（最近邻保持像素感）、边缘外扩 bleed（防图集串色）
@@ -29,7 +30,8 @@ from PySide6.QtCore import (
     QEvent, QPoint, QRect, QSize, Qt, QThread, QTimer, Signal,
 )
 from PySide6.QtGui import (
-    QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QRegion,
+    QColor, QIcon, QImage, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap,
+    QRegion,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout,
@@ -469,7 +471,10 @@ class ImageLab(QWidget):
         self._brush_size = 12
         self._painting = False
         self._crop_rect: list[int] | None = None  # 自由裁切框 [x0, y0, x1, y1]
-        self._drag: str | None = None             # left/right/top/bottom/move/new
+        self._crop_ratio: tuple[int, int] | None = None  # 比例锁定 (w, h)
+        self._crop_guide = False                  # 三分构图参考线
+        self._crop_syncing = False                # 数值面板回填防循环
+        self._drag: str | None = None             # nw/ne/sw/se/left/right/top/bottom/move/new
         self._drag_anchor: tuple[int, int] = (0, 0)
         self._drag_orig: list[int] | None = None
         self._edit_row: int | None = None         # 回填目标帧行（None=非回填模式）
@@ -534,7 +539,7 @@ class ImageLab(QWidget):
         br = QVBoxLayout(g_brush)
         self.cmb_brush = QComboBox()
         self.cmb_brush.addItems(["浏览（不涂抹）", "擦除残留", "恢复误删",
-                                 "裁切框（自由裁切）"])
+                                 "✂ 手动裁切（画布选框）"])
         self.cmb_brush.currentIndexChanged.connect(self._set_brush_mode)
         br.addWidget(self.cmb_brush)
         br.addWidget(QLabel("笔刷大小"))
@@ -624,17 +629,76 @@ class ImageLab(QWidget):
         cl.addLayout(grid)
         tools.addWidget(g_crop)
 
-        g_fc = QGroupBox("自由裁切")
+        g_fc = QGroupBox("✂ 手动裁切（像素级编辑器）")
         fc = QVBoxLayout(g_fc)
-        fc.addWidget(QLabel("先选“裁切框”模式：拖黄线四边微调，\n框内拖动整体移动，框外拖动新建框"))
+        fc.addWidget(QLabel(
+            "画布：拖框新建｜八向手柄缩放｜框内拖动平移\n"
+            "键盘：方向键微调(Shift=10px)｜Alt+方向=调宽高\n"
+            "Enter=应用｜Esc=退出裁切｜建议配合放大镜"))
+        # X / Y 行
+        row_xy = QHBoxLayout()
+        row_xy.addWidget(QLabel("X"))
+        self.sp_cx = QSpinBox()
+        self.sp_cx.setRange(0, 9999)
+        self.sp_cx.valueChanged.connect(self._on_crop_spin)
+        row_xy.addWidget(self.sp_cx)
+        row_xy.addWidget(QLabel("Y"))
+        self.sp_cy = QSpinBox()
+        self.sp_cy.setRange(0, 9999)
+        self.sp_cy.valueChanged.connect(self._on_crop_spin)
+        row_xy.addWidget(self.sp_cy)
+        row_xy.addStretch(1)
+        fc.addLayout(row_xy)
+        # W / H 行
+        row_wh = QHBoxLayout()
+        row_wh.addWidget(QLabel("宽"))
+        self.sp_cw = QSpinBox()
+        self.sp_cw.setRange(2, 9999)
+        self.sp_cw.valueChanged.connect(self._on_crop_spin)
+        row_wh.addWidget(self.sp_cw)
+        row_wh.addWidget(QLabel("高"))
+        self.sp_ch = QSpinBox()
+        self.sp_ch.setRange(2, 9999)
+        self.sp_ch.valueChanged.connect(self._on_crop_spin)
+        row_wh.addWidget(self.sp_ch)
+        row_wh.addStretch(1)
+        fc.addLayout(row_wh)
+        # 比例行：锁定开关 + 预设
+        row_ratio = QHBoxLayout()
+        self.chk_cratio = QCheckBox("锁比例")
+        self.chk_cratio.setToolTip("修改宽时高度按比例联动")
+        self.chk_cratio.toggled.connect(self._on_crop_ratio_toggle)
+        row_ratio.addWidget(self.chk_cratio)
+        self.cmb_cratio = QComboBox()
+        self.cmb_cratio.addItems(["自由", "1:1", "2:1", "1:2",
+                                  "4:1", "8:1", "16:1"])
+        self.cmb_cratio.setToolTip("精灵表/角色帧常用比例；切换后按当前框中心重算")
+        self.cmb_cratio.currentIndexChanged.connect(
+            self._on_crop_ratio_preset)
+        row_ratio.addWidget(self.cmb_cratio, 1)
+        fc.addLayout(row_ratio)
+        # 操作按钮
         row_fc = QHBoxLayout()
         b_fa = QPushButton("应用裁切")
+        b_fa.setProperty("accent", True)
+        b_fa.setToolTip("Enter 同效")
         b_fa.clicked.connect(self.apply_crop)
-        b_fr = QPushButton("重置裁切框")
+        b_fr = QPushButton("重置全图")
         b_fr.clicked.connect(self.reset_crop)
         row_fc.addWidget(b_fa)
         row_fc.addWidget(b_fr)
         fc.addLayout(row_fc)
+        row_fc2 = QHBoxLayout()
+        b_fc2 = QPushButton("收缩到内容")
+        b_fc2.setToolTip("裁切框收紧到非透明内容边界（无 alpha 图按四角背景色判内容）")
+        b_fc2.clicked.connect(self._crop_to_content)
+        b_fg = QPushButton("三分构图线")
+        b_fg.setCheckable(True)
+        b_fg.setToolTip("框内显示三分参考线（像素画构图参考）")
+        b_fg.toggled.connect(lambda v: setattr(self, "_crop_guide", v))
+        row_fc2.addWidget(b_fc2)
+        row_fc2.addWidget(b_fg)
+        fc.addLayout(row_fc2)
         tools.addWidget(g_fc)
 
         g_edit = QGroupBox("编辑")
@@ -783,6 +847,7 @@ class ImageLab(QWidget):
         self.canvas.setMinimumSize(420, 420)
         self.canvas.setStyleSheet("background:#202225; color:#9aa0a6;")
         self.canvas.setMouseTracking(True)          # 无需按下也有 move 事件
+        self.canvas.setFocusPolicy(Qt.StrongFocus)  # 裁切模式接收方向键微调
         self.canvas.installEventFilter(self)
         sc = QScrollArea()
         sc.setWidgetResizable(True)
@@ -1068,12 +1133,17 @@ class ImageLab(QWidget):
         self.canvas.setCursor(Qt.CrossCursor if idx else Qt.ArrowCursor)
         if self._brush_mode == "crop":
             if self.arr is None:
-                self.status("先打开图片再使用裁切框")
+                self.status("先打开图片再使用手动裁切")
                 return
             h, w = self.arr.shape[:2]
+            self._crop_bounds()
             if self._crop_rect is None:
-                self._crop_rect = [0, 0, w, h]
-            self.status("裁切模式：拖黄线四边微调，框内拖动整体移动，框外拖动新建框")
+                self._crop_set_rect(0, 0, w, h)
+            else:
+                self._sync_crop_spins()
+            self.canvas.setFocus()
+            self.status("手动裁切：拖框/八向手柄｜方向键微调(Shift=10px)｜"
+                        "Alt+方向=调宽高｜Enter 应用｜Esc 退出")
         elif self._brush_mode == "erase":
             self.status("擦除模式：左键涂抹抹掉残留")
         elif self._brush_mode == "restore":
@@ -1106,6 +1176,8 @@ class ImageLab(QWidget):
                 if pos is not None and self.chk_mag.isChecked():
                     self._update_magnifier(*pos)
             if self._brush_mode == "crop":
+                if t == QEvent.KeyPress and self._crop_key(event):
+                    return True
                 if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                     self._crop_press(self._img_pos(event, clamp=True))
                 elif t == QEvent.MouseMove and self._drag:
@@ -1123,6 +1195,43 @@ class ImageLab(QWidget):
                     self._painting = False
                     self.status("笔刷修改完成（Ctrl+Z 可撤销）")
         return super().eventFilter(obj, event)
+
+    def _crop_key(self, event: QKeyEvent) -> bool:
+        """裁切模式键盘：方向键微调 / Shift=10px / Alt=调宽高 / Enter / Esc。"""
+        if event.key() == Qt.Key_Escape:            # 退出裁切不受框状态影响
+            self.cmb_brush.setCurrentIndex(0)
+            return True
+        if self._crop_rect is None:
+            return False
+        step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
+        key = event.key()
+        x0, y0, x1, y1 = self._crop_rect
+        if event.modifiers() & Qt.AltModifier:
+            if key == Qt.Key_Right:
+                x1 += step
+            elif key == Qt.Key_Left:
+                x1 -= step
+            elif key == Qt.Key_Down:
+                y1 += step
+            elif key == Qt.Key_Up:
+                y1 -= step
+            else:
+                return False
+        elif key == Qt.Key_Left:
+            x0, x1 = x0 - step, x1 - step
+        elif key == Qt.Key_Right:
+            x0, x1 = x0 + step, x1 + step
+        elif key == Qt.Key_Up:
+            y0, y1 = y0 - step, y1 - step
+        elif key == Qt.Key_Down:
+            y0, y1 = y0 + step, y1 + step
+        elif key in (Qt.Key_Return, Qt.Key_Enter):
+            self.apply_crop()
+            return True
+        else:
+            return False
+        self._crop_set_rect(x0, y0, x1, y1)
+        return True
 
     def _paint_at(self, event: QMouseEvent) -> None:
         pos = self._img_pos(event)
@@ -1143,18 +1252,133 @@ class ImageLab(QWidget):
             self.arr[y0:y1, x0:x1][mask] = src[mask]
         self._render()
 
-    # ---------------- 自由裁切 ----------------
+    # ---------------- 手动裁切 ----------------
+
+    def _crop_bounds(self) -> None:
+        """把数值面板范围绑定到当前图像尺寸（换图/裁切后调用）。"""
+        if self.arr is None:
+            return
+        h, w = self.arr.shape[:2]
+        self.sp_cx.setRange(0, max(0, w - 2))
+        self.sp_cy.setRange(0, max(0, h - 2))
+        self.sp_cw.setRange(2, w)
+        self.sp_ch.setRange(2, h)
+
+    def _crop_set_rect(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        """统一裁切框入口：clamp + 最小 2px + 数值面板同步 + 重渲染。"""
+        if self.arr is None:
+            return
+        h, w = self.arr.shape[:2]
+        x0, x1 = sorted((int(x0), int(x1)))
+        y0, y1 = sorted((int(y0), int(y1)))
+        x0 = max(0, min(x0, w - 2))
+        x1 = max(x0 + 2, min(x1, w))
+        y0 = max(0, min(y0, h - 2))
+        y1 = max(y0 + 2, min(y1, h))
+        self._crop_rect = [x0, y0, x1, y1]
+        self._sync_crop_spins()
+        self._render()
+
+    def _sync_crop_spins(self) -> None:
+        """裁切框 -> 数值面板（防回填循环）。"""
+        if self._crop_rect is None:
+            return
+        x0, y0, x1, y1 = self._crop_rect
+        self._crop_syncing = True
+        try:
+            self.sp_cx.setValue(x0)
+            self.sp_cy.setValue(y0)
+            self.sp_cw.setValue(x1 - x0)
+            self.sp_ch.setValue(y1 - y0)
+        finally:
+            self._crop_syncing = False
+
+    def _on_crop_spin(self) -> None:
+        """数值面板 -> 裁切框（宽改高联动 = 锁定比例）。"""
+        if self._crop_syncing or self.arr is None or self._crop_rect is None:
+            return
+        x0, y0 = self.sp_cx.value(), self.sp_cy.value()
+        w, h = self.sp_cw.value(), self.sp_ch.value()
+        if self.chk_cratio.isChecked() and self._crop_ratio:
+            rw, rh = self._crop_ratio
+            h = max(2, round(w * rh / rw))
+        self._crop_set_rect(x0, y0, x0 + w, y0 + h)
+
+    def _on_crop_ratio_toggle(self, on: bool) -> None:
+        if not on:
+            self._crop_ratio = None
+            self.cmb_cratio.blockSignals(True)
+            self.cmb_cratio.setCurrentIndex(0)
+            self.cmb_cratio.blockSignals(False)
+        elif self._crop_ratio is None:
+            # 无预设时按当前框宽高比为锁定值
+            if self._crop_rect:
+                w = self._crop_rect[2] - self._crop_rect[0]
+                h = self._crop_rect[3] - self._crop_rect[1]
+                self._crop_ratio = (max(1, w), max(1, h))
+
+    def _on_crop_ratio_preset(self, idx: int) -> None:
+        presets = [None, (1, 1), (2, 1), (1, 2), (4, 1), (8, 1), (16, 1)]
+        self._crop_ratio = presets[idx] if idx < len(presets) else None
+        self.chk_cratio.blockSignals(True)
+        self.chk_cratio.setChecked(self._crop_ratio is not None)
+        self.chk_cratio.blockSignals(False)
+        if not (self._crop_ratio and self._crop_rect and self.arr is not None):
+            return
+        rw, rh = self._crop_ratio
+        h_img, w_img = self.arr.shape[:2]
+        x0, y0, x1, y1 = self._crop_rect
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        w = x1 - x0
+        h = max(2, round(w * rh / rw))
+        if h > h_img:                    # 高度越界则改为以高度为基准
+            h = h_img
+            w = max(2, round(h * rw / rh))
+        self._crop_set_rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+    def _crop_to_content(self) -> None:
+        """裁切框收缩到内容边界（alpha 优先；无 alpha 按四角背景色判内容）。"""
+        if self.arr is None:
+            return
+        if self.arr.shape[2] == 4 and (self.arr[:, :, 3] > 0).any():
+            ys, xs = np.where(self.arr[:, :, 3] > 0)
+        else:
+            img = self.arr[:, :, :3].astype(np.int32)
+            corners = [img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]]
+            bg = np.median(np.array(corners, dtype=np.int32), axis=0)
+            mask = np.abs(img - bg).max(axis=2) > 8
+            if not mask.any():
+                self.status("画面没有可识别的内容")
+                return
+            ys, xs = np.where(mask)
+        self._crop_set_rect(int(xs.min()), int(ys.min()),
+                            int(xs.max()) + 1, int(ys.max()) + 1)
+        self.status(f"已收缩到内容: {xs.max() - xs.min() + 1}x"
+                    f"{ys.max() - ys.min() + 1}")
 
     def _crop_hit(self, x: int, y: int) -> str | None:
+        """命中测试：四角优先，其次四边中点，再框内移动，框外新建。"""
         x0, y0, x1, y1 = self._crop_rect
         tol = max(3, int(6 / self._zoom))
-        if abs(x - x0) <= tol:
-            return "left"
-        if abs(x - x1) <= tol:
-            return "right"
-        if abs(y - y0) <= tol:
-            return "top"
-        if abs(y - y1) <= tol:
+        mx, my = (x0 + x1) // 2, (y0 + y1) // 2
+        if abs(x - x0) <= tol and abs(y - y0) <= tol:
+            return "nw"
+        if abs(x - x1) <= tol and abs(y - y0) <= tol:
+            return "ne"
+        if abs(x - x0) <= tol and abs(y - y1) <= tol:
+            return "sw"
+        if abs(x - x1) <= tol and abs(y - y1) <= tol:
+            return "se"
+        if abs(x - x0) <= tol or abs(x - x1) <= tol or \
+                abs(y - y0) <= tol or abs(y - y1) <= tol:
+            if abs(x - mx) <= tol and abs(y - my) <= tol:
+                return "move"
+            if abs(x - x0) <= tol:
+                return "left"
+            if abs(x - x1) <= tol:
+                return "right"
+            if abs(y - y0) <= tol:
+                return "top"
             return "bottom"
         if x0 < x < x1 and y0 < y < y1:
             return "move"
@@ -1166,6 +1390,7 @@ class ImageLab(QWidget):
         x, y = pos
         hit = self._crop_hit(x, y)
         self._drag_anchor = (x, y)
+        self.canvas.setFocus()                      # 方向键微调需要焦点
         if hit:
             self._drag = hit
             self._drag_orig = list(self._crop_rect)
@@ -1180,15 +1405,7 @@ class ImageLab(QWidget):
         x, y = pos
         h, w = self.arr.shape[:2]
         r = self._crop_rect
-        if self._drag == "left":
-            r[0] = int(min(max(x, 0), r[2] - 2))
-        elif self._drag == "right":
-            r[2] = int(max(min(x, w), r[0] + 2))
-        elif self._drag == "top":
-            r[1] = int(min(max(y, 0), r[3] - 2))
-        elif self._drag == "bottom":
-            r[3] = int(max(min(y, h), r[1] + 2))
-        elif self._drag == "move":
+        if self._drag == "move":
             dx = x - self._drag_anchor[0]
             dy = y - self._drag_anchor[1]
             ox0, oy0, ox1, oy1 = self._drag_orig
@@ -1197,17 +1414,73 @@ class ImageLab(QWidget):
             ny0 = min(max(0, oy0 + dy), h - bh)
             r[0], r[2] = nx0, nx0 + bw
             r[1], r[3] = ny0, ny0 + bh
+        elif self._drag in ("nw", "ne", "sw", "se"):
+            # 四角缩放：对角固定；锁比例时短边向长边看齐
+            fx = r[2] if self._drag in ("nw", "sw") else r[0]
+            fy = r[3] if self._drag in ("nw", "ne") else r[1]
+            nx = min(max(x, 0), w - 1)
+            ny = min(max(y, 0), h - 1)
+            nw, nh = max(2, abs(nx - fx)), max(2, abs(ny - fy))
+            if self._crop_ratio:
+                rw, rh = self._crop_ratio
+                nh = max(2, round(nw * rh / rw))
+                nh = min(nh, h)
+                nw = max(2, round(nh * rw / rh))
+            sx = 1 if nx >= fx else -1
+            sy = 1 if ny >= fy else -1
+            self._crop_set_rect(fx, fy, fx + sx * nw, fy + sy * nh)
+            return
+        elif self._drag in ("left", "right"):
+            r[0 if self._drag == "left" else 2] = int(
+                min(max(x, 0), w) if self._drag == "right"
+                else min(max(x, 0), r[2] - 2))
+            if self._crop_ratio:
+                self._crop_fit_ratio_edges(r, "h")
+        elif self._drag in ("top", "bottom"):
+            r[1 if self._drag == "top" else 3] = int(
+                min(max(y, 0), h) if self._drag == "bottom"
+                else min(max(y, 0), r[3] - 2))
+            if self._crop_ratio:
+                self._crop_fit_ratio_edges(r, "w")
         else:  # new
             ax, ay = self._drag_anchor
             r[0], r[2] = min(ax, x), max(ax, x)
             r[1], r[3] = min(ay, y), max(ay, y)
+            if self._crop_ratio and abs(x - ax) > 4:
+                rw, rh = self._crop_ratio
+                nh = max(2, round((r[2] - r[0]) * rh / rw))
+                r[1], r[3] = ay, ay + nh if y >= ay else ay - nh
+        self._sync_crop_spins()
         self._render()
+
+    def _crop_fit_ratio_edges(self, r: list, axis: str) -> None:
+        """边手柄锁比例：以不变的宽/高为基准，垂直方向按中心重算。"""
+        if not self._crop_ratio:
+            return
+        rw, rh = self._crop_ratio
+        h_img, w_img = self.arr.shape[:2]
+        if axis == "h":
+            nw = r[2] - r[0]
+            nh = max(2, round(nw * rh / rw))
+            cy = (r[1] + r[3]) / 2
+            nh = min(nh, h_img)
+            r[1] = max(0, int(cy - nh / 2))
+            r[3] = min(h_img, r[1] + nh)
+            r[1] = max(0, r[3] - nh)
+        else:
+            nh = r[3] - r[1]
+            nw = max(2, round(nh * rw / rh))
+            cx = (r[0] + r[2]) / 2
+            nw = min(nw, w_img)
+            r[0] = max(0, int(cx - nw / 2))
+            r[2] = min(w_img, r[0] + nw)
+            r[0] = max(0, r[2] - nw)
 
     def apply_crop(self) -> None:
         if self.arr is None or not self._crop_rect:
             QMessageBox.information(
                 self, "图像工具坊",
-                "请先在操作模式中选择“裁切框”，调整好黄线后再应用。")
+                "请先在操作模式中选择“✂ 手动裁切”，调整好黄线后再应用。")
             return
         x0, y0, x1, y1 = [int(v) for v in self._crop_rect]
         x0, x1 = sorted((max(0, x0), min(self.arr.shape[1], x1)))
@@ -1218,14 +1491,15 @@ class ImageLab(QWidget):
         self._push_undo()
         self.arr = self.arr[y0:y1, x0:x1].copy()
         self._crop_rect = None
+        self._crop_bounds()
         self._render()
-        self.status(f"已裁切: {x1 - x0}x{y1 - y0}")
+        self.status(f"已裁切: {x1 - x0}x{y1 - y0}（可继续框选，Esc 退出裁切）")
 
     def reset_crop(self) -> None:
         if self.arr is not None:
             h, w = self.arr.shape[:2]
-            self._crop_rect = [0, 0, w, h]
-            self._render()
+            self._crop_bounds()
+            self._crop_set_rect(0, 0, w, h)
             self.status("裁切框已重置为全图")
 
     # ---------------- 裁切与导出 ----------------
@@ -1695,19 +1969,46 @@ class ImageLab(QWidget):
         self.canvas.setPixmap(pm)
 
     def _paint_crop_overlay(self, pm: QPixmap) -> None:
-        """在画布上叠加裁切框：外部半透明遮罩 + 黄色边线 + 四边中点手柄。"""
+        """在画布上叠加裁切框：外部半透明遮罩 + 黄色边线 + 八向手柄
+        + 可选三分构图线 + 尺寸标签。"""
         p = QPainter(pm)
         x0, y0, x1, y1 = [int(round(v * self._zoom)) for v in self._crop_rect]
         rect = QRect(x0, y0, x1 - x0, y1 - y0)
+        mx, my = (x0 + x1) // 2, (y0 + y1) // 2
         p.setClipRegion(QRegion(pm.rect()) - QRegion(rect))
         p.fillRect(pm.rect(), QColor(0, 0, 0, 130))
         p.setClipping(False)
+        # 三分构图参考线
+        if self._crop_guide and rect.width() > 40 and rect.height() > 40:
+            p.setPen(QPen(QColor(255, 208, 0, 80), 1, Qt.DashLine))
+            for i in (1, 2):
+                gx = x0 + rect.width() * i // 3
+                gy = y0 + rect.height() * i // 3
+                p.drawLine(gx, y0, gx, y1)
+                p.drawLine(x0, gy, x1, gy)
+        # 边线
         p.setPen(QPen(QColor(255, 208, 0), 2))
         p.drawRect(rect)
-        p.fillRect(x0 - 3, (y0 + y1) // 2 - 3, 6, 6, QColor(255, 208, 0))
-        p.fillRect(x1 - 3, (y0 + y1) // 2 - 3, 6, 6, QColor(255, 208, 0))
-        p.fillRect((x0 + x1) // 2 - 3, y0 - 3, 6, 6, QColor(255, 208, 0))
-        p.fillRect((x0 + x1) // 2 - 3, y1 - 3, 6, 6, QColor(255, 208, 0))
+        # 八向手柄：四角大方块 + 四边小方块
+        p.setBrush(QColor(255, 208, 0))
+        p.setPen(Qt.NoPen)
+        for hx, hy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            p.drawRect(hx - 4, hy - 4, 8, 8)
+        for hx, hy in ((mx, y0), (mx, y1), (x0, my), (x1, my)):
+            p.drawRect(hx - 3, hy - 3, 6, 6)
+        # 尺寸标签（框内顶部居中，深色底）
+        w_px = self._crop_rect[2] - self._crop_rect[0]
+        h_px = self._crop_rect[3] - self._crop_rect[1]
+        label = f"{w_px} x {h_px}"
+        p.setPen(QColor(255, 208, 0))
+        f = p.font()
+        f.setPointSize(9)
+        p.setFont(f)
+        tw = p.fontMetrics().horizontalAdvance(label) + 10
+        lx = min(max(mx - tw // 2, x0), x1 - tw)
+        ly = y0 + 4 if rect.height() > 30 else y0 - 16
+        p.fillRect(lx, ly, tw, 16, QColor(0, 0, 0, 170))
+        p.drawText(lx + 5, ly + 12, label)
         p.end()
 
     def _update_magnifier(self, ix: int, iy: int) -> None:
