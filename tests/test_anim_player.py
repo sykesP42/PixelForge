@@ -226,6 +226,58 @@ def main() -> int:
     p.set_frames(make_frames(), name="test")
     print("[OK] 逐帧位移/缩放: 播放器入口一键应用（右移 5px 保留，不重新底对齐）+ 动画组同步")
 
+    # 17. 手动裁切：进入/数值面板/比例/键盘/应用到全部帧/仅当前帧/撤销/退出
+    from PySide6.QtCore import Qt, QEvent
+    from PySide6.QtGui import QKeyEvent
+    p.set_frames(make_frames(), name="crop")
+    assert p.crop_bar.isHidden(), "裁切条默认隐藏"
+    p.btn_crop.click()
+    assert p._crop_active and not p.crop_bar.isHidden(), "应进入裁切模式"
+    assert p._crop_rect == [0, 0, 44, 70], f"初始框应为全帧: {p._crop_rect}"
+    # 数值面板 -> 框
+    p.sp_cx.setValue(4)
+    p.sp_cy.setValue(6)
+    p.sp_cw.setValue(20)
+    p.sp_ch.setValue(10)
+    assert p._crop_rect == [4, 6, 24, 16], p._crop_rect
+    # 比例预设 1:1 -> 中心不变正方形
+    p.cmb_cratio.setCurrentIndex(1)
+    assert p._crop_ratio == (1, 1)
+    x0, y0, x1, y1 = p._crop_rect
+    assert (x1 - x0) == (y1 - y0), f"1:1 应正方形: {p._crop_rect}"
+    # 键盘：右移 1px / Shift+右 10px / Alt+右 加宽 / Enter 应用全部 / Esc 退出
+    def _key(k, mod=Qt.NoModifier):
+        return QKeyEvent(QEvent.KeyPress, k, mod)
+
+    before = list(p._crop_rect)
+    assert p.eventFilter(p.canvas, _key(Qt.Key_Right)) is True
+    assert p._crop_rect[0] == before[0] + 1
+    before = list(p._crop_rect)
+    p.eventFilter(p.canvas, _key(Qt.Key_Right, Qt.ShiftModifier))
+    assert p._crop_rect[0] == before[0] + 10, "Shift 应 10px 步进"
+    before = list(p._crop_rect)
+    p.eventFilter(p.canvas, _key(Qt.Key_Right, Qt.AltModifier))
+    assert p._crop_rect[2] - p._crop_rect[0] == \
+        before[2] - before[0] + 1, "Alt+右 应只加宽"
+    # Enter = 应用到全部帧
+    p.cmb_cratio.setCurrentIndex(0)   # 解锁比例
+    p._crop_set_rect(4, 5, 44, 35)    # 40x30（帧宽 44）
+    p.eventFilter(p.canvas, _key(Qt.Key_Return))
+    assert all(f.shape[:2] == (30, 40) for f in p._frames), \
+        f"全部帧应被裁到 40x30: {[f.shape for f in p._frames]}"
+    assert len(p._clips["crop"]) == 3, "动画组应同步"
+    # 仅当前帧 + 撤销
+    p._crop_set_rect(2, 2, 20, 18)
+    p._crop_apply(False)
+    assert p._frames[0].shape[:2] == (16, 18), p._frames[0].shape
+    assert p._frames[1].shape[:2] == (30, 40), "其他帧不受影响"
+    p._crop_undo_apply()
+    assert all(f.shape[:2] == (30, 40) for f in p._frames), "撤销应恢复全部帧"
+    # Esc 退出
+    p.eventFilter(p.canvas, _key(Qt.Key_Escape))
+    assert not p._crop_active and p.crop_bar.isHidden()
+    print("[OK] 手动裁切: 进入/数值/1:1/键盘三态/Enter应用全部/仅当前帧/撤销/Esc退出")
+
     print("\n动画播放器全部测试通过 ✔")
     return 0
 

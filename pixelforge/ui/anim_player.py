@@ -3,6 +3,8 @@
 播放设置：播放/暂停/停止、FPS（1-60，播放中可调）、方向（正放/倒放/往返）、
 循环开关、缩放（适配/1x/2x/4x）、背景（深灰/黑/白/棋盘格）、帧条逐帧浏览、
 洋葱皮（前红/后蓝半透明残影叠加，前后各 N 帧）。
+帧级编辑：逐帧位移/缩放、手动裁切（八向手柄 + 数值面板 + 比例锁定 +
+键盘微调 + 收缩到内容，可应用到当前帧或全部帧，单级撤销）。
 数据源：工具坊"发送到动画播放器"，或"打开帧目录"（按文件名排序的 PNG）。
 """
 from __future__ import annotations
@@ -12,8 +14,10 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon, QImage, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QColor, QIcon, QImage, QKeyEvent, QPainter, QPen, QPixmap, QRegion,
+)
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMenu, QMessageBox, QPushButton, QSlider, QSpinBox,
@@ -21,6 +25,9 @@ from PySide6.QtWidgets import (
 )
 
 from pixelforge.processing.aseprite_io import export_aseprite, frames_by_tag
+from pixelforge.processing.crop_geom import (
+    corner_rect, fit_edges, hit_test, normalize_rect,
+)
 from pixelforge.processing.editing import bleed_edges, tween_x2
 from pixelforge.processing.image_processor import frame_hull
 
@@ -45,6 +52,15 @@ class AnimPlayer(QWidget):
         self._name = "anim"
         self._pos = 0
         self._ping_dir = 1        # 往返模式当前方向
+        # 手动裁切编辑器状态
+        self._crop_active = False
+        self._crop_rect: list[int] | None = None   # 帧像素坐标
+        self._crop_ratio: tuple[int, int] | None = None
+        self._crop_drag: str | None = None
+        self._crop_anchor = (0, 0)
+        self._crop_orig: list[int] | None = None
+        self._crop_undo: list[np.ndarray] | None = None   # 单级撤销
+        self._crop_syncing = False
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._advance)
         self._build_ui()
@@ -58,6 +74,9 @@ class AnimPlayer(QWidget):
         self.canvas.setAlignment(Qt.AlignCenter)
         self.canvas.setMinimumSize(420, 420)
         self.canvas.setStyleSheet("background:#202225; color:#9aa0a6;")
+        self.canvas.setMouseTracking(True)          # 裁切拖拽无需按下也有 move
+        self.canvas.setFocusPolicy(Qt.StrongFocus)  # 裁切模式接收方向键
+        self.canvas.installEventFilter(self)
         lay.addWidget(self.canvas, 1)
 
         bar1 = QHBoxLayout()
@@ -149,6 +168,14 @@ class AnimPlayer(QWidget):
             "一键应用到全部帧、一键脚底对齐，消掉帧间抖动")
         self.btn_adjust.clicked.connect(self._open_frame_adjust)
         bar2.addWidget(self.btn_adjust)
+        self.btn_crop = QPushButton("✂ 手动裁切")
+        self.btn_crop.setToolTip(
+            "手动裁切编辑器：拖框/八向手柄，数值面板 + 比例锁定\n"
+            "键盘：方向键微调(Shift=10px)、Alt+方向=调宽高、Enter=应用到全部帧、Esc=退出\n"
+            "可应用到当前帧或全部帧（撤销一步）")
+        self.btn_crop.setCheckable(True)
+        self.btn_crop.clicked.connect(self._crop_toggle)
+        bar2.addWidget(self.btn_crop)
         self.btn_export = QPushButton("导出...")
         self.btn_export.setProperty("accent", True)
         menu = QMenu(self)
@@ -166,6 +193,64 @@ class AnimPlayer(QWidget):
         bar2.addWidget(self.btn_export)
         bar2.addStretch(1)
         lay.addLayout(bar2)
+
+        # 手动裁切工具条（进入裁切模式才显示）
+        self.crop_bar = QWidget()
+        cb = QHBoxLayout(self.crop_bar)
+        cb.setContentsMargins(0, 0, 0, 0)
+        cb.addWidget(QLabel("✂"))
+        self.crop_lbl = QLabel("拖框/手柄裁切，方向键微调")
+        self.crop_lbl.setStyleSheet("color:#8a8f98; font-size:11px;")
+        cb.addWidget(self.crop_lbl)
+        cb.addWidget(QLabel("X"))
+        self.sp_cx = QSpinBox()
+        self.sp_cx.setFixedWidth(58)
+        self.sp_cx.valueChanged.connect(self._on_crop_spin)
+        cb.addWidget(self.sp_cx)
+        cb.addWidget(QLabel("Y"))
+        self.sp_cy = QSpinBox()
+        self.sp_cy.setFixedWidth(58)
+        self.sp_cy.valueChanged.connect(self._on_crop_spin)
+        cb.addWidget(self.sp_cy)
+        cb.addWidget(QLabel("宽"))
+        self.sp_cw = QSpinBox()
+        self.sp_cw.setFixedWidth(58)
+        self.sp_cw.valueChanged.connect(self._on_crop_spin)
+        cb.addWidget(self.sp_cw)
+        cb.addWidget(QLabel("高"))
+        self.sp_ch = QSpinBox()
+        self.sp_ch.setFixedWidth(58)
+        self.sp_ch.valueChanged.connect(self._on_crop_spin)
+        cb.addWidget(self.sp_ch)
+        self.cmb_cratio = QComboBox()
+        self.cmb_cratio.addItems(["自由", "1:1", "2:1", "1:2",
+                                  "4:1", "8:1", "16:1"])
+        self.cmb_cratio.setFixedWidth(64)
+        self.cmb_cratio.setToolTip("比例预设（按当前框中心重算）")
+        self.cmb_cratio.currentIndexChanged.connect(
+            self._on_crop_ratio_preset)
+        cb.addWidget(self.cmb_cratio)
+        b_shrink = QPushButton("收缩到内容")
+        b_shrink.setToolTip("裁切框收紧到当前帧内容边界")
+        b_shrink.clicked.connect(self._crop_to_content)
+        cb.addWidget(b_shrink)
+        b_apply = QPushButton("应用到全部帧")
+        b_apply.setProperty("accent", True)
+        b_apply.setToolTip("Enter 同效：所有帧按同一矩形裁切")
+        b_apply.clicked.connect(lambda: self._crop_apply(True))
+        cb.addWidget(b_apply)
+        b_apply_cur = QPushButton("仅当前帧")
+        b_apply_cur.clicked.connect(lambda: self._crop_apply(False))
+        cb.addWidget(b_apply_cur)
+        b_undo = QPushButton("↶ 撤销")
+        b_undo.setToolTip("撤销上一步裁切")
+        b_undo.clicked.connect(self._crop_undo_apply)
+        cb.addWidget(b_undo)
+        b_exit = QPushButton("✕ 退出")
+        b_exit.clicked.connect(self._crop_exit)
+        cb.addWidget(b_exit)
+        self.crop_bar.setVisible(False)
+        lay.addWidget(self.crop_bar)
 
         self.lst_frames = QListWidget()
         self.lst_frames.setObjectName("frameStrip")
@@ -236,6 +321,318 @@ class AnimPlayer(QWidget):
         self._render()
         h, w = frames[0].shape[:2]
         self.status(f"已应用逐帧位移/缩放：{len(frames)} 帧 → 统一画布 {w}x{h}")
+
+    # ---------------- 手动裁切 ----------------
+
+    def _crop_toggle(self) -> None:
+        if self._crop_active:
+            self._crop_exit()
+        else:
+            self._crop_enter()
+
+    def _crop_enter(self) -> None:
+        if not self._frames:
+            self.status("没有可裁切的帧——先打开 GIF/帧目录或从工具坊发送")
+            self.btn_crop.setChecked(False)
+            return
+        self._timer.stop()                     # 裁切期间暂停播放
+        self.btn_play.setText("▶ 播放")
+        self._crop_active = True
+        self.btn_crop.setChecked(True)
+        self.crop_bar.setVisible(True)
+        h, w = self._frames[self._pos].shape[:2]
+        self.sp_cx.setRange(0, max(0, w - 2))
+        self.sp_cy.setRange(0, max(0, h - 2))
+        self.sp_cw.setRange(2, w)
+        self.sp_ch.setRange(2, h)
+        self._crop_set_rect(0, 0, w, h)
+        self.canvas.setFocus()
+        self.status("手动裁切：拖框/八向手柄｜方向键微调(Shift=10px)｜"
+                    "Alt+方向=调宽高｜Enter=应用到全部帧｜Esc=退出")
+
+    def _crop_exit(self) -> None:
+        self._crop_active = False
+        self.btn_crop.setChecked(False)
+        self.crop_bar.setVisible(False)
+        self._crop_rect = None
+        self._crop_drag = None
+        self._render()
+
+    def _crop_pm_geo(self):
+        """当前帧 -> 画布 pixmap 映射 (scale, ox, oy, w, h)。"""
+        pm = self.canvas.pixmap()
+        if pm is None or pm.isNull() or not self._frames:
+            return None
+        h, w = self._frames[self._pos].shape[:2]
+        s = pm.width() / max(1, w)
+        ox = max(0, (self.canvas.width() - pm.width()) // 2)
+        oy = max(0, (self.canvas.height() - pm.height()) // 2)
+        return s, ox, oy, w, h
+
+    def _crop_event_pos(self, event):
+        g = self._crop_pm_geo()
+        if g is None:
+            return None
+        s, ox, oy, w, h = g
+        x = int((event.position().x() - ox) / s)
+        y = int((event.position().y() - oy) / s)
+        return min(max(x, 0), w - 1), min(max(y, 0), h - 1)
+
+    def _crop_set_rect(self, x0: int, y0: int, x1: int, y1: int) -> None:
+        if not self._frames:
+            return
+        h, w = self._frames[self._pos].shape[:2]
+        self._crop_rect = normalize_rect(x0, y0, x1, y1, w, h)
+        self._sync_crop_spins()
+        self._render()
+
+    def _sync_crop_spins(self) -> None:
+        if self._crop_rect is None:
+            return
+        x0, y0, x1, y1 = self._crop_rect
+        self._crop_syncing = True
+        try:
+            self.sp_cx.setValue(x0)
+            self.sp_cy.setValue(y0)
+            self.sp_cw.setValue(x1 - x0)
+            self.sp_ch.setValue(y1 - y0)
+        finally:
+            self._crop_syncing = False
+
+    def _on_crop_spin(self) -> None:
+        if self._crop_syncing or not self._crop_rect:
+            return
+        x0, y0 = self.sp_cx.value(), self.sp_cy.value()
+        w, h = self.sp_cw.value(), self.sp_ch.value()
+        if self._crop_ratio:
+            rw, rh = self._crop_ratio
+            h = max(2, round(w * rh / rw))
+        self._crop_set_rect(x0, y0, x0 + w, y0 + h)
+
+    def _on_crop_ratio_preset(self, idx: int) -> None:
+        presets = [None, (1, 1), (2, 1), (1, 2), (4, 1), (8, 1), (16, 1)]
+        self._crop_ratio = presets[idx] if idx < len(presets) else None
+        if not (self._crop_ratio and self._crop_rect):
+            return
+        rw, rh = self._crop_ratio
+        fh, fw = self._frames[self._pos].shape[:2]
+        x0, y0, x1, y1 = self._crop_rect
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        w = x1 - x0
+        h = max(2, round(w * rh / rw))
+        if h > fh:
+            h = fh
+            w = max(2, round(h * rw / rh))
+        self._crop_set_rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+
+    def _crop_to_content(self) -> None:
+        if not self._frames or not self._crop_rect:
+            return
+        a = self._frames[self._pos]
+        if a.shape[2] == 4 and (a[:, :, 3] > 0).any():
+            ys, xs = np.where(a[:, :, 3] > 0)
+        else:
+            img = a[:, :, :3].astype(np.int32)
+            corners = [img[0, 0], img[0, -1], img[-1, 0], img[-1, -1]]
+            bg = np.median(np.array(corners, dtype=np.int32), axis=0)
+            mask = np.abs(img - bg).max(axis=2) > 8
+            if not mask.any():
+                self.status("当前帧没有可识别的内容")
+                return
+            ys, xs = np.where(mask)
+        self._crop_set_rect(int(xs.min()), int(ys.min()),
+                            int(xs.max()) + 1, int(ys.max()) + 1)
+        self.status(f"已收缩到内容: {xs.max() - xs.min() + 1}x"
+                    f"{ys.max() - ys.min() + 1}")
+
+    def _crop_press(self, pos) -> None:
+        if pos is None or self._crop_rect is None:
+            return
+        x, y = pos
+        self.canvas.setFocus()
+        self._crop_anchor = (x, y)
+        hit = hit_test(self._crop_rect, x, y,
+                       max(3, int(6 / self._crop_scale())))
+        if hit:
+            self._crop_drag = hit
+            self._crop_orig = list(self._crop_rect)
+        else:
+            self._crop_drag = "new"
+            self._crop_rect = [x, y, x, y]
+
+    def _crop_scale(self) -> float:
+        g = self._crop_pm_geo()
+        return g[0] if g else 1.0
+
+    def _crop_move(self, pos) -> None:
+        if pos is None or not self._crop_drag or self._crop_rect is None:
+            return
+        x, y = pos
+        fh, fw = self._frames[self._pos].shape[:2]
+        r = self._crop_rect
+        d = self._crop_drag
+        if d == "move":
+            dx, dy = x - self._crop_anchor[0], y - self._crop_anchor[1]
+            ox0, oy0, ox1, oy1 = self._crop_orig
+            bw, bh = ox1 - ox0, oy1 - oy0
+            r[0] = min(max(0, ox0 + dx), fw - bw)
+            r[2] = r[0] + bw
+            r[1] = min(max(0, oy0 + dy), fh - bh)
+            r[3] = r[1] + bh
+        elif d in ("nw", "ne", "sw", "se"):
+            fx = r[2] if d in ("nw", "sw") else r[0]
+            fy = r[3] if d in ("nw", "ne") else r[1]
+            self._crop_rect = corner_rect(
+                (fx, fy), (x, y), self._crop_ratio, fw, fh)
+        elif d in ("left", "right"):
+            r[0 if d == "left" else 2] = int(
+                min(max(x, 0), fw) if d == "right"
+                else min(max(x, 0), r[2] - 2))
+            r[:] = fit_edges(r, "h", self._crop_ratio, fw, fh)
+        elif d in ("top", "bottom"):
+            r[1 if d == "top" else 3] = int(
+                min(max(y, 0), fh) if d == "bottom"
+                else min(max(y, 0), r[3] - 2))
+            r[:] = fit_edges(r, "w", self._crop_ratio, fw, fh)
+        else:  # new
+            ax, ay = self._crop_anchor
+            r[0], r[2] = min(ax, x), max(ax, x)
+            r[1], r[3] = min(ay, y), max(ay, y)
+            if self._crop_ratio and abs(x - ax) > 4:
+                rw, rh = self._crop_ratio
+                nh = max(2, round((r[2] - r[0]) * rh / rw))
+                r[1], r[3] = ay, ay + nh if y >= ay else ay - nh
+            r[:] = normalize_rect(*r, fw, fh)
+        self._sync_crop_spins()
+        self._render()
+
+    def _crop_key(self, event: QKeyEvent) -> bool:
+        if event.key() == Qt.Key_Escape:
+            self._crop_exit()
+            return True
+        if self._crop_rect is None:
+            return False
+        step = 10 if (event.modifiers() & Qt.ShiftModifier) else 1
+        key = event.key()
+        x0, y0, x1, y1 = self._crop_rect
+        if event.modifiers() & Qt.AltModifier:
+            if key == Qt.Key_Right:
+                x1 += step
+            elif key == Qt.Key_Left:
+                x1 -= step
+            elif key == Qt.Key_Down:
+                y1 += step
+            elif key == Qt.Key_Up:
+                y1 -= step
+            else:
+                return False
+        elif key == Qt.Key_Left:
+            x0, x1 = x0 - step, x1 - step
+        elif key == Qt.Key_Right:
+            x0, x1 = x0 + step, x1 + step
+        elif key == Qt.Key_Up:
+            y0, y1 = y0 - step, y1 - step
+        elif key == Qt.Key_Down:
+            y0, y1 = y0 + step, y1 + step
+        elif key in (Qt.Key_Return, Qt.Key_Enter):
+            self._crop_apply(True)
+            return True
+        else:
+            return False
+        self._crop_set_rect(x0, y0, x1, y1)
+        return True
+
+    def _crop_apply(self, all_frames: bool) -> None:
+        if not self._crop_rect or not self._frames:
+            return
+        x0, y0, x1, y1 = self._crop_rect
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            self.status("裁切区域太小")
+            return
+        self._crop_undo = [f.copy() for f in self._frames]   # 单级撤销
+        if all_frames:
+            new = [f[y0:y1, x0:x1].copy() for f in self._frames]
+            self._frames = self._normalize(new)   # 统一画布（同尺寸，no-op）
+        else:
+            f = self._frames[self._pos]
+            new = list(self._frames)
+            new[self._pos] = f[y0:y1, x0:x1].copy()
+            self._frames = new                   # 单帧保留自身尺寸，不补齐画布
+        cur = self.cmb_clips.currentText()
+        if cur in self._clips:
+            self._clips[cur] = list(self._frames)
+        self._pos = min(self._pos, len(self._frames) - 1)
+        h, w = self._frames[self._pos].shape[:2]
+        self.sp_cx.setRange(0, max(0, w - 2))
+        self.sp_cy.setRange(0, max(0, h - 2))
+        self.sp_cw.setRange(2, w)
+        self.sp_ch.setRange(2, h)
+        self._crop_set_rect(0, 0, w, h)   # 连续裁切：重置为全图框
+        self._rebuild_strip()
+        self.status(f"已裁切{'全部帧' if all_frames else '当前帧'}: "
+                    f"{x1 - x0}x{y1 - y0}（↶ 可撤销，Esc 退出）")
+
+    def _crop_undo_apply(self) -> None:
+        if not self._crop_undo:
+            self.status("没有可撤销的裁切")
+            return
+        self._frames = self._crop_undo
+        self._crop_undo = None
+        cur = self.cmb_clips.currentText()
+        if cur in self._clips:
+            self._clips[cur] = list(self._frames)
+        self._pos = min(self._pos, len(self._frames) - 1)
+        self._rebuild_strip()
+        self._render()
+        self.status("已撤销上一步裁切")
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self.canvas and self._crop_active:
+            t = event.type()
+            if t == QEvent.KeyPress and self._crop_key(event):
+                return True
+            if t == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self._crop_press(self._crop_event_pos(event))
+            elif t == QEvent.MouseMove and self._crop_drag:
+                self._crop_move(self._crop_event_pos(event))
+            elif t == QEvent.MouseButtonRelease:
+                self._crop_drag = None
+        return super().eventFilter(obj, event)
+
+    def _paint_crop_overlay(self, pm: QPixmap) -> None:
+        """裁切框叠层：外部暗化 + 黄边 + 八向手柄 + 尺寸标签。"""
+        g = self._crop_pm_geo()
+        if g is None or self._crop_rect is None:
+            return
+        s, _ox, _oy, _w, _h = g
+        p = QPainter(pm)
+        x0, y0, x1, y1 = [int(round(v * s)) for v in self._crop_rect]
+        rect = QRect(x0, y0, x1 - x0, y1 - y0)
+        mx, my = (x0 + x1) // 2, (y0 + y1) // 2
+        p.setClipRegion(QRegion(pm.rect()) - QRegion(rect))
+        p.fillRect(pm.rect(), QColor(0, 0, 0, 130))
+        p.setClipping(False)
+        p.setPen(QPen(QColor(255, 208, 0), 2))
+        p.drawRect(rect)
+        p.setBrush(QColor(255, 208, 0))
+        p.setPen(Qt.NoPen)
+        for hx, hy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+            p.drawRect(hx - 4, hy - 4, 8, 8)
+        for hx, hy in ((mx, y0), (mx, y1), (x0, my), (x1, my)):
+            p.drawRect(hx - 3, hy - 3, 6, 6)
+        w_px = self._crop_rect[2] - self._crop_rect[0]
+        h_px = self._crop_rect[3] - self._crop_rect[1]
+        label = f"{w_px} x {h_px}"
+        p.setPen(QColor(255, 208, 0))
+        f = p.font()
+        f.setPointSize(9)
+        p.setFont(f)
+        tw = p.fontMetrics().horizontalAdvance(label) + 10
+        lx = min(max(mx - tw // 2, x0), max(x0, x1 - tw))
+        ly = y0 + 4 if rect.height() > 30 else y0 - 16
+        p.fillRect(lx, ly, tw, 16, QColor(0, 0, 0, 170))
+        p.drawText(lx + 5, ly + 12, label)
+        p.end()
 
     def _sync_clips_combo(self, current: str) -> None:
         self.cmb_clips.blockSignals(True)
@@ -465,6 +862,8 @@ class AnimPlayer(QWidget):
         elif zm != "1x":
             k = int(zm[0])
             pm = pm.scaled(w * k, h * k, Qt.KeepAspectRatio, Qt.FastTransformation)
+        if self._crop_active and self._crop_rect:
+            self._paint_crop_overlay(pm)
         self.canvas.setPixmap(pm)
 
         self.lbl_frame.setText(f"{self._pos + 1} / {len(self._frames)}")

@@ -40,6 +40,9 @@ from PySide6.QtWidgets import (
 )
 
 from pixelforge.processing import editing
+from pixelforge.processing.crop_geom import (
+    corner_rect, fit_edges, hit_test, normalize_rect,
+)
 from pixelforge.processing.aseprite_io import import_aseprite
 from pixelforge.processing.image_processor import (
     ImageProcessor,
@@ -1269,13 +1272,7 @@ class ImageLab(QWidget):
         if self.arr is None:
             return
         h, w = self.arr.shape[:2]
-        x0, x1 = sorted((int(x0), int(x1)))
-        y0, y1 = sorted((int(y0), int(y1)))
-        x0 = max(0, min(x0, w - 2))
-        x1 = max(x0 + 2, min(x1, w))
-        y0 = max(0, min(y0, h - 2))
-        y1 = max(y0 + 2, min(y1, h))
-        self._crop_rect = [x0, y0, x1, y1]
+        self._crop_rect = normalize_rect(x0, y0, x1, y1, w, h)
         self._sync_crop_spins()
         self._render()
 
@@ -1358,31 +1355,8 @@ class ImageLab(QWidget):
 
     def _crop_hit(self, x: int, y: int) -> str | None:
         """命中测试：四角优先，其次四边中点，再框内移动，框外新建。"""
-        x0, y0, x1, y1 = self._crop_rect
         tol = max(3, int(6 / self._zoom))
-        mx, my = (x0 + x1) // 2, (y0 + y1) // 2
-        if abs(x - x0) <= tol and abs(y - y0) <= tol:
-            return "nw"
-        if abs(x - x1) <= tol and abs(y - y0) <= tol:
-            return "ne"
-        if abs(x - x0) <= tol and abs(y - y1) <= tol:
-            return "sw"
-        if abs(x - x1) <= tol and abs(y - y1) <= tol:
-            return "se"
-        if abs(x - x0) <= tol or abs(x - x1) <= tol or \
-                abs(y - y0) <= tol or abs(y - y1) <= tol:
-            if abs(x - mx) <= tol and abs(y - my) <= tol:
-                return "move"
-            if abs(x - x0) <= tol:
-                return "left"
-            if abs(x - x1) <= tol:
-                return "right"
-            if abs(y - y0) <= tol:
-                return "top"
-            return "bottom"
-        if x0 < x < x1 and y0 < y < y1:
-            return "move"
-        return None
+        return hit_test(self._crop_rect, x, y, tol)
 
     def _crop_press(self, pos: tuple[int, int] | None) -> None:
         if pos is None or self._crop_rect is None:
@@ -1418,30 +1392,21 @@ class ImageLab(QWidget):
             # 四角缩放：对角固定；锁比例时短边向长边看齐
             fx = r[2] if self._drag in ("nw", "sw") else r[0]
             fy = r[3] if self._drag in ("nw", "ne") else r[1]
-            nx = min(max(x, 0), w - 1)
-            ny = min(max(y, 0), h - 1)
-            nw, nh = max(2, abs(nx - fx)), max(2, abs(ny - fy))
-            if self._crop_ratio:
-                rw, rh = self._crop_ratio
-                nh = max(2, round(nw * rh / rw))
-                nh = min(nh, h)
-                nw = max(2, round(nh * rw / rh))
-            sx = 1 if nx >= fx else -1
-            sy = 1 if ny >= fy else -1
-            self._crop_set_rect(fx, fy, fx + sx * nw, fy + sy * nh)
+            self._crop_rect = corner_rect(
+                (fx, fy), (x, y), self._crop_ratio, w, h)
+            self._sync_crop_spins()
+            self._render()
             return
         elif self._drag in ("left", "right"):
             r[0 if self._drag == "left" else 2] = int(
                 min(max(x, 0), w) if self._drag == "right"
                 else min(max(x, 0), r[2] - 2))
-            if self._crop_ratio:
-                self._crop_fit_ratio_edges(r, "h")
+            r[:] = fit_edges(r, "h", self._crop_ratio, w, h)
         elif self._drag in ("top", "bottom"):
             r[1 if self._drag == "top" else 3] = int(
                 min(max(y, 0), h) if self._drag == "bottom"
                 else min(max(y, 0), r[3] - 2))
-            if self._crop_ratio:
-                self._crop_fit_ratio_edges(r, "w")
+            r[:] = fit_edges(r, "w", self._crop_ratio, w, h)
         else:  # new
             ax, ay = self._drag_anchor
             r[0], r[2] = min(ax, x), max(ax, x)
@@ -1452,29 +1417,6 @@ class ImageLab(QWidget):
                 r[1], r[3] = ay, ay + nh if y >= ay else ay - nh
         self._sync_crop_spins()
         self._render()
-
-    def _crop_fit_ratio_edges(self, r: list, axis: str) -> None:
-        """边手柄锁比例：以不变的宽/高为基准，垂直方向按中心重算。"""
-        if not self._crop_ratio:
-            return
-        rw, rh = self._crop_ratio
-        h_img, w_img = self.arr.shape[:2]
-        if axis == "h":
-            nw = r[2] - r[0]
-            nh = max(2, round(nw * rh / rw))
-            cy = (r[1] + r[3]) / 2
-            nh = min(nh, h_img)
-            r[1] = max(0, int(cy - nh / 2))
-            r[3] = min(h_img, r[1] + nh)
-            r[1] = max(0, r[3] - nh)
-        else:
-            nh = r[3] - r[1]
-            nw = max(2, round(nh * rw / rh))
-            cx = (r[0] + r[2]) / 2
-            nw = min(nw, w_img)
-            r[0] = max(0, int(cx - nw / 2))
-            r[2] = min(w_img, r[0] + nw)
-            r[0] = max(0, r[2] - nw)
 
     def apply_crop(self) -> None:
         if self.arr is None or not self._crop_rect:
