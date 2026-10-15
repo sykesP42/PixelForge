@@ -278,6 +278,59 @@ def main() -> int:
     assert not p._crop_active and p.crop_bar.isHidden()
     print("[OK] 手动裁切: 进入/数值/1:1/键盘三态/Enter应用全部/仅当前帧/撤销/Esc退出")
 
+    # 18. GIF 直导入 + 帧操作（编辑信号/复制/空白/删除/排序/回填替换）
+    from PIL import Image as _PILImage
+    from PySide6.QtWidgets import QFileDialog
+    gpath = TMP / "walk_cycle.gif"
+    cols = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 255)]
+    frs = [_PILImage.new("RGBA", (24, 32), c) for c in cols]
+    frs[0].save(gpath, save_all=True, append_images=frs[1:], duration=125,
+                loop=0)
+    p.set_frames(make_frames(), name="gif_prev")
+    orig_gofn = QFileDialog.getOpenFileName
+    QFileDialog.getOpenFileName = lambda *a, **k: (str(gpath), "")
+    try:
+        p.import_gif_dialog()
+    finally:
+        QFileDialog.getOpenFileName = orig_gofn
+    assert len(p._frames) == 3, f"GIF 应拆 3 帧: {len(p._frames)}"
+    assert p._name == "walk_cycle"
+    assert p.slider_fps.value() == 8, f"应按 125ms 帧率设 FPS=8: {p.slider_fps.value()}"
+    # 编辑信号：请求把当前帧送工具坊
+    got_pos = []
+    p.edit_frame.connect(got_pos.append)
+    p._frame_edit()
+    assert got_pos == [0], f"应请求编辑第 0 帧: {got_pos}"
+    # 复制帧
+    p._frame_dup()
+    assert len(p._frames) == 4 and p._pos == 1
+    assert np.array_equal(p._frames[1], p._frames[0]), "复制帧应内容一致"
+    # 插入空白帧
+    p._frame_insert_blank()
+    assert len(p._frames) == 5 and p._frames[2].shape[:2] == (32, 24)
+    assert p._frames[2][:, :, 3].max() == 0, "空白帧应全透明"
+    # 上移/下移
+    p._frame_move(1)                      # 空白帧从 2 -> 3
+    assert p._pos == 3 and p._frames[3][:, :, 3].max() == 0
+    p._frame_move(-1)                     # 再移回 2
+    assert p._pos == 2
+    # 删除帧
+    p._frame_delete()
+    assert len(p._frames) == 4 and p._frames[2][:, :, 3].max() > 0, \
+        "删除的应是空白帧"
+    # 只剩一帧时删除被拒
+    p._frames = [p._frames[0]]
+    p._frame_delete()
+    assert len(p._frames) == 1, "至少保留一帧"
+    # 回填替换（工具坊 -> 播放器）
+    p.set_frames(make_frames(), name="backfill")
+    repl = np.full((70, 44, 4), (9, 9, 9, 255), np.uint8)
+    assert p.replace_frame(1, repl) is True
+    assert np.array_equal(p._frames[1][0, 0], repl[0, 0])
+    assert len(p._clips["backfill"]) == 3, "动画组应同步"
+    assert p.frame_arr(99) is None and p.frame_arr(0) is not None
+    print("[OK] GIF 直导入(拆帧+帧率) + 帧操作: 编辑信号/复制/空白/排序/删除/回填")
+
     print("\n动画播放器全部测试通过 ✔")
     return 0
 

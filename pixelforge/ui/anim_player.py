@@ -4,8 +4,9 @@
 循环开关、缩放（适配/1x/2x/4x）、背景（深灰/黑/白/棋盘格）、帧条逐帧浏览、
 洋葱皮（前红/后蓝半透明残影叠加，前后各 N 帧）。
 帧级编辑：逐帧位移/缩放、手动裁切（八向手柄 + 数值面板 + 比例锁定 +
-键盘微调 + 收缩到内容，可应用到当前帧或全部帧，单级撤销）。
-数据源：工具坊"发送到动画播放器"，或"打开帧目录"（按文件名排序的 PNG）。
+键盘微调 + 收缩到内容，可应用到当前帧或全部帧，单级撤销）、
+帧操作（GIF 直导入 / 送工具坊编辑回填 / 复制 / 插入空白 / 删除 / 上下移）。
+数据源：工具坊"发送到动画播放器"，"打开帧目录"，"导入 GIF/APNG"，Aseprite 多动画。
 """
 from __future__ import annotations
 
@@ -16,7 +17,8 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QEvent, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColor, QIcon, QImage, QKeyEvent, QPainter, QPen, QPixmap, QRegion,
+    QColor, QIcon, QImage, QKeyEvent, QKeySequence, QPainter, QPen, QPixmap,
+    QRegion, QShortcut,
 )
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
@@ -28,7 +30,7 @@ from pixelforge.processing.aseprite_io import export_aseprite, frames_by_tag
 from pixelforge.processing.crop_geom import (
     corner_rect, fit_edges, hit_test, normalize_rect,
 )
-from pixelforge.processing.editing import bleed_edges, tween_x2
+from pixelforge.processing.editing import bleed_edges, load_gif_frames, tween_x2
 from pixelforge.processing.image_processor import frame_hull
 
 
@@ -44,6 +46,7 @@ _BG_COLORS = {"深灰": (43, 45, 49), "黑": (16, 16, 16), "白": (238, 238, 238
 
 class AnimPlayer(QWidget):
     state_changed = Signal(str)
+    edit_frame = Signal(int)        # 请求把某帧送图像工具坊编辑（回填原位置）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -156,6 +159,10 @@ class AnimPlayer(QWidget):
         btn_open = QPushButton("打开帧目录...")
         btn_open.clicked.connect(self.open_folder_dialog)
         bar2.addWidget(btn_open)
+        btn_gif = QPushButton("导入 GIF...")
+        btn_gif.setToolTip("导入 GIF/APNG：自动拆帧并按原帧率载入，编辑后可再导出 GIF")
+        btn_gif.clicked.connect(self.import_gif_dialog)
+        bar2.addWidget(btn_gif)
         btn_sess = QPushButton("保存会话...")
         btn_sess.clicked.connect(self.save_session_dialog)
         bar2.addWidget(btn_sess)
@@ -252,12 +259,41 @@ class AnimPlayer(QWidget):
         self.crop_bar.setVisible(False)
         lay.addWidget(self.crop_bar)
 
+        # 帧操作条：编辑/复制/插入/删除/排序（对当前帧生效）
+        bar_f = QHBoxLayout()
+        bar_f.setContentsMargins(0, 0, 0, 0)
+        self.lbl_fops = QLabel("帧操作")
+        self.lbl_fops.setStyleSheet("color:#8a8f98; font-size:11px;")
+        bar_f.addWidget(self.lbl_fops)
+        for text, tip, fn in (
+                ("✎ 编辑", "把当前帧送图像工具坊编辑，完成后回填原位置", self._frame_edit),
+                ("⧉ 复制", "复制当前帧并插入到其后（Ctrl+D）", self._frame_dup),
+                ("＋ 空白", "在当前帧后插入一张同尺寸空白帧", self._frame_insert_blank),
+                ("🗑 删除", "删除当前帧（Delete）", self._frame_delete),
+                ("↑ 上移", "当前帧前移一位（Alt+↑）", lambda: self._frame_move(-1)),
+                ("↓ 下移", "当前帧后移一位（Alt+↓）", lambda: self._frame_move(1)),
+        ):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setFixedHeight(24)
+            b.clicked.connect(fn)
+            bar_f.addWidget(b)
+        bar_f.addStretch(1)
+        lay.addLayout(bar_f)
+
         self.lst_frames = QListWidget()
         self.lst_frames.setObjectName("frameStrip")
         self.lst_frames.setIconSize(QSize(64, 64))
         self.lst_frames.setViewMode(QListWidget.IconMode)
         self.lst_frames.setMaximumHeight(110)
         self.lst_frames.currentRowChanged.connect(self._on_strip_click)
+        # 帧操作快捷键（帧条获焦点时生效）
+        QShortcut(QKeySequence("Ctrl+D"), self.lst_frames, self._frame_dup)
+        QShortcut(QKeySequence("Delete"), self.lst_frames, self._frame_delete)
+        QShortcut(QKeySequence("Alt+Up"), self.lst_frames,
+                  lambda: self._frame_move(-1))
+        QShortcut(QKeySequence("Alt+Down"), self.lst_frames,
+                  lambda: self._frame_move(1))
         lay.addWidget(self.lst_frames)
 
     # ---------------- 数据 ----------------
@@ -633,6 +669,122 @@ class AnimPlayer(QWidget):
         p.fillRect(lx, ly, tw, 16, QColor(0, 0, 0, 170))
         p.drawText(lx + 5, ly + 12, label)
         p.end()
+
+    # ---------------- 帧编辑操作 ----------------
+
+    def frame_arr(self, pos: int) -> np.ndarray | None:
+        """取某一帧的拷贝（越界返回 None）。"""
+        if 0 <= pos < len(self._frames):
+            return self._frames[pos].copy()
+        return None
+
+    def replace_frame(self, pos: int, arr: np.ndarray) -> bool:
+        """工具坊回填：替换某一帧并刷新（尺寸变化时重新归一画布）。"""
+        if not (0 <= pos < len(self._frames)):
+            return False
+        new = list(self._frames)
+        new[pos] = arr
+        self._frames = self._normalize(new)
+        cur = self.cmb_clips.currentText()
+        if cur in self._clips:
+            self._clips[cur] = list(self._frames)
+        self._pos = pos
+        self._rebuild_strip()
+        self._render()
+        return True
+
+    def _frames_changed(self, msg: str) -> None:
+        """帧列表结构变化统一收尾：同步动画组 + 帧条 + 渲染 + 状态。"""
+        cur = self.cmb_clips.currentText()
+        if cur in self._clips:
+            self._clips[cur] = list(self._frames)
+        self._pos = min(max(self._pos, 0), max(0, len(self._frames) - 1))
+        self._rebuild_strip()
+        self._render()
+        if msg:
+            self.status(msg)
+
+    def _frame_edit(self) -> None:
+        if not self._frames:
+            self.status("没有可编辑的帧")
+            return
+        self.edit_frame.emit(self._pos)
+
+    def _frame_dup(self) -> None:
+        if not self._frames:
+            return
+        self._frames.insert(self._pos + 1, self._frames[self._pos].copy())
+        self._pos += 1
+        self._frames_changed(f"已复制帧 #{self._pos}（共 {len(self._frames)} 帧）")
+
+    def _frame_insert_blank(self) -> None:
+        if not self._frames:
+            self.status("先载入帧再插入空白帧")
+            return
+        h, w = self._frames[0].shape[:2]
+        self._frames.insert(self._pos + 1, np.zeros((h, w, 4), np.uint8))
+        self._pos += 1
+        self._frames_changed(f"已插入空白帧 #{self._pos}（{w}x{h}）")
+
+    def _frame_delete(self) -> None:
+        if not self._frames:
+            return
+        if len(self._frames) <= 1:
+            self.status("至少保留一帧")
+            return
+        del self._frames[self._pos]
+        self._pos = min(self._pos, len(self._frames) - 1)
+        self._frames_changed(f"已删除帧（剩余 {len(self._frames)} 帧）")
+
+    def _frame_move(self, delta: int) -> None:
+        if len(self._frames) < 2:
+            return
+        i = self._pos
+        j = i + delta
+        if not (0 <= j < len(self._frames)):
+            return
+        self._frames[i], self._frames[j] = self._frames[j], self._frames[i]
+        self._pos = j
+        self._frames_changed(f"帧 #{i + 1} 已{'上' if delta < 0 else '下'}移")
+
+    def import_gif_dialog(self) -> None:
+        """导入 GIF/APNG：拆帧 + 按原帧率设置 FPS。"""
+        f, _ = QFileDialog.getOpenFileName(
+            self, "导入 GIF / APNG", "", "动图 (*.gif *.apng)")
+        if not f:
+            return
+        fps = 8
+        try:
+            frames = load_gif_frames(Path(f))
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "动画播放", f"读取失败: {e}")
+            return
+        if not frames:
+            QMessageBox.information(self, "动画播放", "动图中没有帧")
+            return
+        # 读取原始帧率（PIL 时长 -> FPS，夹在 1~60）
+        try:
+            from PIL import Image
+            with Image.open(f) as im:
+                dur = im.info.get("duration") or 0
+                if isinstance(dur, (int, float)) and dur > 0:
+                    fps = max(1, min(60, round(1000.0 / dur)))
+        except Exception:  # noqa: BLE001 帧率读取失败用默认
+            pass
+        name = Path(f).stem
+        self._frames = self._normalize(frames)
+        self._clips = {name: list(self._frames)}
+        self._name = name
+        self._pos = 0
+        self._ping_dir = 1
+        self._timer.stop()
+        self.btn_play.setText("▶ 播放")
+        self.slider_fps.setValue(fps)
+        self._rebuild_strip()
+        self._render()
+        self._sync_clips_combo(name)
+        self.status(f"已导入 {Path(f).name}：{len(frames)} 帧，"
+                    f"FPS {fps}（可继续编辑，导出支持 GIF）")
 
     def _sync_clips_combo(self, current: str) -> None:
         self.cmb_clips.blockSignals(True)

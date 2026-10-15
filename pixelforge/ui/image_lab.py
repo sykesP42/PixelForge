@@ -985,12 +985,13 @@ class ImageLab(QWidget):
         self._set_zoom(1.0)
         self.status(f"已载入 {name}（编辑后点「回填」按钮返回审核区）")
 
-    def set_edit_target(self, row: int | None) -> None:
+    def set_edit_target(self, row: int | None,
+                        label: str = "审核区帧") -> None:
         """设置回填目标行；None 退出回填模式。"""
         self._edit_row = row
         self.b_back.setVisible(row is not None)
         if row is not None:
-            self.b_back.setText(f"↩ 回填到审核区帧 #{row}")
+            self.b_back.setText(f"↩ 回填到{label} #{row}")
 
     def _back_to_review(self) -> None:
         if self.arr is not None:

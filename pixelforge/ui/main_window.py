@@ -809,6 +809,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self.image_lab, "图像工具坊")
         self.anim_player = AnimPlayer()
         self.anim_player.status = lambda m: self.log(f"[动画] {m}")
+        self.anim_player.edit_frame.connect(self._on_player_edit_frame)
         tabs.addTab(self.anim_player, "动画播放")
         self.batch_panel = BatchPanel(settings_provider=self._collect_settings)
         self.batch_panel.status = lambda m: self.log(f"[批量] {m}")
@@ -3925,21 +3926,40 @@ class MainWindow(QMainWindow):
         arr = self.review.frame_arr(row)
         if arr is None:
             return
-        self._lab_edit_row = row
+        self._lab_edit_row = ("review", row)
         self.image_lab.load_arr(arr, f"frame_{row}")
         self.image_lab.set_edit_target(row)
         self.tabs.setCurrentIndex(1)
         self.log(f"帧 #{row} 已送工具坊（编辑后点「↩ 回填」按钮返回）")
 
-    def _on_frame_back(self, arr) -> None:
-        row = getattr(self, "_lab_edit_row", None)
-        if row is None:
+    def _on_player_edit_frame(self, pos: int) -> None:
+        """动画帧送工具坊编辑：记住位置，编辑后回填原帧。"""
+        arr = self.anim_player.frame_arr(pos)
+        if arr is None:
+            self.log("该位置没有可编辑的帧")
             return
-        if self.review.replace_frame(row, arr):
-            self.log(f"工具坊编辑结果已回填到帧 #{row}")
+        self._lab_edit_row = ("player", pos)
+        self.image_lab.load_arr(arr, f"player_frame_{pos}")
+        self.image_lab.set_edit_target(pos, label="动画帧")
+        self.tabs.setCurrentWidget(self.image_lab)
+        self.log(f"动画帧 #{pos} 已送工具坊（编辑后点「↩ 回填」按钮返回）")
+
+    def _on_frame_back(self, arr) -> None:
+        tgt = getattr(self, "_lab_edit_row", None)
+        if tgt is None:
+            return
+        if isinstance(tgt, tuple) and tgt[0] == "player":
+            _, pos = tgt
+            if self.anim_player.replace_frame(pos, arr):
+                self.log(f"工具坊编辑结果已回填到动画帧 #{pos}")
+            self.tabs.setCurrentWidget(self.anim_player)
+        else:
+            row = tgt[1] if isinstance(tgt, tuple) else tgt
+            if self.review.replace_frame(row, arr):
+                self.log(f"工具坊编辑结果已回填到帧 #{row}")
+            self.tabs.setCurrentIndex(0)
         self.image_lab.set_edit_target(None)
         self._lab_edit_row = None
-        self.tabs.setCurrentIndex(0)
 
     def log(self, msg: str) -> None:
         self.txt_log.appendPlainText(_log_line(msg))
