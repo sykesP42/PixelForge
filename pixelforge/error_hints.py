@@ -22,6 +22,9 @@ _HINTS: list[tuple[tuple[str, ...], str]] = [
     (("failed to validate", "return type", "required input is missing"),
      "工作流校验失败：模板节点与当前 ComfyUI 版本不匹配，"
      "或占位符未被正确替换——检查工作流模板"),
+    (("繁忙", "请稍后重试"),
+     "中转上游容量不足：换个模型别名、画质降为 medium、或换个时段重试"
+     "（应用对繁忙类错误会自动退避重试 4 次）"),
     (("connection", "urlopen error", "timed out", "10061", "connection refused"),
      "无法连接 ComfyUI：确认服务已启动、地址端口正确；"
      "云端模式请检查网络与 API 密钥"),
@@ -41,10 +44,13 @@ def translate_error(msg: str) -> str:
 
 # ---- 网络类错误自动重试分类 ----
 
+# ---- 网络类错误自动重试分类 ----
+
 _RETRYABLE_KEYS = (
     "网络错误", "timed out", "timeout", "同步请求重试均失败",
     "图片下载全部通道失败", "图床上传失败",
-    "connection", "urlopen error", "10061", "临时维护", "系统繁忙",
+    "connection", "urlopen error", "10061", "临时维护",
+    "繁忙", "请稍后重试", "try again later", "server is busy",
     "upstream", "http 429", "http 500", "http 502", "http 503",
     "http 504", "http 529", "远程主机", "connectionreset",
 )
@@ -67,3 +73,15 @@ def is_retryable_error(msg: str) -> bool:
     if any(k in low for k in _NON_RETRYABLE_KEYS):
         return False
     return any(k in low for k in _RETRYABLE_KEYS)
+
+
+_BUSY_KEYS = (
+    "繁忙", "请稍后重试", "server is busy", "try again later",
+    "http 429", "http 529", "系统繁忙",
+)
+
+
+def is_busy_error(msg: str) -> bool:
+    """上游繁忙类错误：窗口通常持续数分钟，退避应比普通网络抖动更久。"""
+    low = (msg or "").lower()
+    return any(k in low for k in _BUSY_KEYS)

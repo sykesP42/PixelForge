@@ -226,11 +226,15 @@ class _GPTEngineWorker(QRunnable):
 
     def _generate_with_retry(self, generate_grid, full_prompt: str,
                              refs: list, tag: str, out_dir) -> str:
-        """单个动作生成，网络类错误自动重试 2 次（指数退避 5s/10s，可中断）。"""
-        from pixelforge.error_hints import is_retryable_error
+        """单个动作生成，错误自动重试。
+
+        网络抖动类 2 次（5s/10s）；上游繁忙类窗口持续数分钟，
+        4 次退避 10/20/40/60s（可中断），总覆盖约 2 分钟。
+        """
+        from pixelforge.error_hints import is_busy_error, is_retryable_error
         from pixelforge.gpt_engine import CloudEngineError
-        max_retry = 2
-        for attempt in range(max_retry + 1):
+        waits = [5, 10]
+        for attempt in range(6):
             try:
                 return generate_grid(
                     self.s.gpt_api_key, self.s.gpt_base_url,
@@ -242,13 +246,18 @@ class _GPTEngineWorker(QRunnable):
                     should_cancel=lambda: self.cancelled,
                     log=lambda m: self.sig.progress.emit(m))
             except CloudEngineError as e:
-                if (self.cancelled or attempt >= max_retry
-                        or not is_retryable_error(str(e))):
+                if self.cancelled or not is_retryable_error(str(e)):
                     raise
-                wait = 5 * (attempt + 1)
+                busy = is_busy_error(str(e))
+                max_retry = 4 if busy else 2
+                waits = [10, 20, 40, 60] if busy else waits
+                if attempt >= max_retry:
+                    raise
+                wait = waits[attempt]
                 self.sig.progress.emit(
-                    f"[GPT] {tag} 网络类错误，{wait}s 后自动重试 "
-                    f"{attempt + 1}/{max_retry}: {str(e)[:120]}")
+                    f"[GPT] {tag} {'上游繁忙' if busy else '网络类错误'}，"
+                    f"{wait}s 后自动重试 {attempt + 1}/{max_retry}"
+                    f": {str(e)[:120]}")
                 for _ in range(wait * 10):   # 可中断退避
                     if self.cancelled:
                         raise CloudEngineError("⏹ 任务已停止")

@@ -36,6 +36,8 @@ def main() -> int:
         "HTTP 429: too many requests",
         "图床上传失败（3 次重试）: eof",
         "提交失败: 上游繁忙，系统繁忙请稍后再试",
+        "云端任务失败: error 抱歉，系统繁忙，请稍后重试",
+        "云端任务失败: error AI服务繁忙，请稍后重试",
     ]
     non_retryable = [
         "⏹ 任务已停止",
@@ -119,6 +121,47 @@ def main() -> int:
         print("[OK] 3. 不可重试错误（401）立即失败，不烧重试次数")
     finally:
         gpt_mod.generate_grid = orig
+
+    # ---------- 4. 上游繁忙类：4 次重试（10/20/40/60s 退避）后成功 ----------
+    from pixelforge.error_hints import is_busy_error
+    assert is_busy_error("云端任务失败: error 抱歉，系统繁忙，请稍后重试")
+    assert is_busy_error("云端任务失败: error AI服务繁忙")
+    assert not is_busy_error("网络错误: connection refused")
+    calls["n"] = 0
+
+    def fake_busy_then_ok(*a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise CloudEngineError("云端任务失败: error 抱歉，系统繁忙，请稍后重试")
+        return grid_path
+
+    gpt_mod.generate_grid = fake_busy_then_ok
+    waits_seen = []
+    try:
+        s3 = types.SimpleNamespace(
+            gpt_api_key="k", gpt_base_url="https://x", prompt="hero idle",
+            negative_prompt="", gpt_model="gpt-image-2", gpt_size="1k",
+            gpt_quality="medium", gpt_oversea=False, gpt_background="auto",
+            output_path=lambda: tmp)
+        w3 = _GPTEngineWorker(s3, ["idle"], [])
+        log3, done3, failed3 = [], [], []
+        w3.sig.progress.connect(log3.append)
+        w3.sig.done.connect(done3.append)
+        w3.sig.failed.connect(failed3.append)
+        __import__("time").sleep = lambda s: waits_seen.append(s)
+        w3.run()
+        assert not failed3, f"繁忙重试后应成功: {failed3}"
+        assert done3 and calls["n"] == 5, \
+            f"繁忙类应调用 5 次（4 失败+1 成功）: {calls['n']}"
+        total_backoff = round(sum(waits_seen))
+        assert total_backoff == 130, \
+            f"繁忙退避总时长应 10+20+40+60=130s: {total_backoff}"
+        assert any("上游繁忙" in m for m in log3), \
+            f"日志应标注上游繁忙: {[m for m in log3 if '繁忙' in m]}"
+        print("[OK] 4. 上游繁忙类 4 次重试（10/20/40/60s 退避）后成功 + 日志标注")
+    finally:
+        gpt_mod.generate_grid = orig
+        __import__("time").sleep = orig_sleep
 
     print("\n失败自动重试全部测试通过 ✔")
     return 0
